@@ -57,7 +57,7 @@ struct TerrainConfig
     int downloadPerHost{1};
     int downloadRetries{3};
     unsigned int httpTimeoutMs{5000};
-    std::string userAgent{"gz-dynamic-terrain/0.2.0"};
+    std::string userAgent{"gz-dynamic-terrain/0.2.1"};
     std::string cacheDir{"~/.cache/gz_dynamic_terrain"};
     std::size_t decodedDemCacheMb{256};
     bool dynamicZoom{true};

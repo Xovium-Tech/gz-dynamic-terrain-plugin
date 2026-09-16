@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DISTRO="${1:-harmonic}"
 BUILD_GUI="${BUILD_GUI:-OFF}"
+BUILD_TESTING="${BUILD_TESTING:-OFF}"
 
 if (( $# > 1 )); then
     echo "Usage: $0 [harmonic|jetty|classic]" >&2
@@ -31,12 +32,21 @@ case "${BUILD_GUI^^}" in
         exit 2
         ;;
 esac
+case "${BUILD_TESTING^^}" in
+    ON|TRUE|YES|Y|1) BUILD_TESTING=ON ;;
+    OFF|FALSE|NO|N|0) BUILD_TESTING=OFF ;;
+    *)
+        echo "BUILD_TESTING must be ON or OFF." >&2
+        exit 2
+        ;;
+esac
 
 BUILD_DIR="$ROOT/build-$DISTRO"
 cmake -S "$ROOT" -B "$BUILD_DIR" \
     -DGZ_DISTRO="$DISTRO" \
     -DBUILD_SIMULATOR=ON \
     -DBUILD_GUI="$BUILD_GUI" \
+    -DBUILD_TESTING="$BUILD_TESTING" \
     -DCMAKE_BUILD_TYPE=Release
 cmake --build "$BUILD_DIR" --parallel "$JOBS"
 

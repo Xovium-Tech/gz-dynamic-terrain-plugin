@@ -68,7 +68,7 @@ namespace dynamic_terrain
                     return;
                 }
                 spherical_ = sphericalComponent->Data();
-                logInfo("[DynamicTerrain][STARTUP] v0.2.0 dynamic terrain renderer enabled",
+                logInfo("[DynamicTerrain][STARTUP] v0.2.1 dynamic terrain renderer enabled",
                         " worldEntity=", worldEntity_,
                         " elevation_ref=", spherical_->ElevationReference());
                 logInfo("[DynamicTerrain][STARTUP] visual terrain will NOT create SDF heightmap tiles");
@@ -414,7 +414,7 @@ namespace dynamic_terrain
                 if (const auto *name = ecm.Component<gz::sim::components::Name>(entity))
                     cfg.modelName = name->Data();
                 registerModelConfig(entity, cfg);
-                logInfo("[DynamicTerrain][CONFIG] registered v0.2.0 model configuration model=",
+                logInfo("[DynamicTerrain][CONFIG] registered v0.2.1 model configuration model=",
                         cfg.modelName.empty() ? std::to_string(entity) : cfg.modelName,
                         " entity=", entity);
             }

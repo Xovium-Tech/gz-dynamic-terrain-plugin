@@ -1,6 +1,7 @@
 # Validation and test coverage
 
-These are local checks for v0.2.0 performed on September 16, 2026. They distinguish
+These are local checks for v0.2.0 and the v0.2.1 source-only build workflow,
+performed on September 16, 2026. They distinguish
 compilation from short component/runtime tests; they are not a claim of complete
 simulator compatibility or long-running flight validation.
 
@@ -101,6 +102,14 @@ fresh Jetty plugin-loading test confirmed both startup/configuration messages
 report `v0.2.0`. Its installed libraries have no missing dependencies or custom
 OpenCV/CUDA paths; this was a local validation build, not a published archive.
 
+For v0.2.1, a fresh copy of the source without `.git` or generated files was
+configured for Jetty with system OpenCV 4.6 and built using
+`JOBS=2 ./build.sh jetty`. It produced only the core and system runtime libraries, with no GUI or
+test targets. Dependencies resolved without missing or custom OpenCV/CUDA
+libraries, and compiled version strings reported 0.2.1. The helper also passed
+15 mocked configurations and three invalid-input checks, including explicit
+test enablement. The simulator algorithms and CI matrix were unchanged.
+
 ## Reproducing the checks
 
 Use the isolated distro environments described above, then configure each build
@@ -137,5 +146,5 @@ paths are unnecessary in an ordinary single-distro installation.
 The CI workflow has been added but has not been executed on GitHub by this task.
 The local tests do not cover PX4 flight, production imagery/elevation services,
 long-duration streaming, every physics backend, or every camera type. See
-[releasing.md](releasing.md) for clean tagged builds used to prepare binary
-archives; the earlier custom-OpenCV validation builds are not release assets.
+[releasing.md](releasing.md) for source-only publication. Users compile locally;
+the local validation libraries are not uploaded as release assets.

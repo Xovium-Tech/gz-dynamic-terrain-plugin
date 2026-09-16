@@ -1,0 +1,17 @@
+if(NOT DEFINED SOURCE_DIR)
+    message(FATAL_ERROR "SOURCE_DIR must identify the repository root")
+endif()
+file(GLOB_RECURSE core_files
+    "${SOURCE_DIR}/include/dynamic_terrain/core/*.hh"
+    "${SOURCE_DIR}/src/core/*.cc")
+foreach(source IN LISTS core_files)
+    file(READ "${source}" contents)
+    if(contents MATCHES "#[ \t]*include[ \t]*[<\"](gz/|gazebo/|ignition/|Ogre|Qt|Q[A-Z]|sdf/|dynamic_terrain/adapters/)")
+        message(FATAL_ERROR "Simulator dependency leaked into core: ${source}")
+    endif()
+    if(contents MATCHES "(gz::|gazebo::|ignition::|Ogre::|sdf::)")
+        message(FATAL_ERROR "Simulator type leaked into core: ${source}")
+    endif()
+endforeach()
+list(LENGTH core_files core_file_count)
+message(STATUS "Core boundary checked in ${core_file_count} files")

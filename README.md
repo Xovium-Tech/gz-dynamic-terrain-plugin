@@ -1,8 +1,12 @@
 # DynamicTerrainSystem
 
-Map imagery and elevation terrain streaming for Gazebo Harmonic.
+Map imagery and elevation terrain streaming for Gazebo Harmonic, Gazebo Jetty and Gazebo Classic 11.
 
 The plugin downloads terrain tiles around a moving aircraft and adds them to the server's sensor scene. As the aircraft moves, the terrain follows it, nearby imagery gains detail, and off-screen meshes and textures are released. Collision terrain is built separately around the vehicle.
+
+![Streamed satellite imagery draped over elevation terrain in Gazebo](docs/images/terrain-preview.jpg)
+
+Terrain camera view captured from a simulation on September 16, 2026.
 
 Features:
 
@@ -12,46 +16,119 @@ Features:
 - camera-based eviction of off-screen rendering resources
 - bounded in-memory image and elevation caches
 - local download cache for revisiting an area
-- moving collision heightmap and temporary startup ground
+- moving collision terrain and temporary startup ground
 
-Built for Gazebo Harmonic (`gz-sim8`) with Ogre2. One model is tracked per world. PX4 and a separate camera streaming plugin are optional.
+One shared terrain engine handles downloading, caching, DEM processing, meshes, collision patches and streaming. Harmonic and Jetty use one Gazebo Sim adapter with Ogre2; Classic 11 uses a separate world/visual adapter with Ogre1. One model is tracked per world. PX4 and a separate camera streaming plugin are optional.
+
+## Supported Gazebo versions
+
+| Target | Simulator family | Rendering | Optional GUI |
+| --- | --- | --- | --- |
+| `harmonic` | gz-sim8, rendering8, plugin2, SDFormat14 | Ogre2 | gz-gui8 / Qt5 |
+| `jetty` | gz-sim10, rendering10, plugin4, SDFormat16 | Ogre2 | gz-gui10 / Qt6 |
+| `classic` | Gazebo Classic 11 | Ogre1 | Classic visual plugin; no Qt code in this project |
+
+Build each target separately. A library compiled for one distro must **not** be
+copied into another distro. `GZ_DISTRO` defaults to `harmonic`; unknown values
+and changing it in an existing build directory are rejected.
 
 ## Requirements
 
-Tested on Ubuntu 24.04. Install Gazebo Harmonic using the [official Ubuntu instructions](https://gazebosim.org/docs/harmonic/install_ubuntu/), then install the build dependencies:
+The core requires a C++17 compiler, CMake, Curl, OpenCV (core, imgcodecs, imgproc)
+and threads. Modern adapters additionally require Protobuf and the selected
+Gazebo development packages, including its Ogre2 rendering backend. Follow the
+[Harmonic](https://gazebosim.org/docs/harmonic/install_ubuntu/) or
+[Jetty](https://gazebosim.org/docs/jetty/install_ubuntu/) Ubuntu installation
+instructions. For example, on Ubuntu 24.04 with the Gazebo repository configured:
 
 ```bash
-sudo apt update
-sudo apt install -y \
-    build-essential cmake pkg-config \
-    libgz-sim8-dev libgz-plugin2-dev libgz-rendering8-ogre2-dev \
-    libgz-gui8-dev libogre-next-2.3-dev \
-    libcurl4-openssl-dev libopencv-dev \
-    libprotobuf-dev protobuf-compiler \
-    qtbase5-dev qtdeclarative5-dev
+sudo apt install build-essential cmake pkg-config libcurl4-openssl-dev \
+    libopencv-dev libprotobuf-dev protobuf-compiler
+# Harmonic:
+sudo apt install libgz-sim8-dev libgz-plugin2-dev libgz-rendering8-ogre2-dev
+# Jetty (in its own environment):
+sudo apt install libgz-sim10-dev libgz-plugin4-dev libgz-rendering10-ogre2-dev
 ```
 
-An active camera sensor and the Ogre2 Sensors system are needed to render terrain. Internet access is needed for tiles that are not already cached.
+`BUILD_GUI=OFF` does not discover Qt or gz-gui to configure or build this project's
+server plugin. Distributor development packages may still pull GUI packages via
+the package manager. GUI builds require `libgz-gui8-dev`, `qtbase5-dev`,
+`qtdeclarative5-dev` for Harmonic, or `libgz-gui10-dev`, `qt6-base-dev`,
+`qt6-declarative-dev` for Jetty. Set `BUILD_GUI=ON` to build the existing
+`libDynamicTerrainGui.so` preview plugin.
+
+Use a separate Ubuntu 20.04 environment for Classic 11 with `gazebo11`,
+`libgazebo11-dev`, Curl and OpenCV development packages. Do not install Classic
+and Jetty into the same CI environment. This repository supplies a separate CI job.
+
+An active camera sensor and the Ogre2 Sensors system are needed to render modern
+server terrain. Internet access is needed for tiles not already cached.
 
 ## Build
 
-```bash
-git clone https://github.com/syvixi/gz-dynamic-terrain-plugin.git
-cd gz-dynamic-terrain-plugin
-
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j2
-```
-
-The system library is `build/libgz-dynamic-terrain-system.so`. Keep `libgz-dynamic-terrain-core.so` alongside it.
-
-Add the build directory to Gazebo's plugin path:
+From the repository root:
 
 ```bash
-export GZ_SIM_SYSTEM_PLUGIN_PATH="$PWD/build${GZ_SIM_SYSTEM_PLUGIN_PATH:+:$GZ_SIM_SYSTEM_PLUGIN_PATH}"
+# Gazebo Harmonic
+cmake -S . -B build-harmonic -DGZ_DISTRO=harmonic -DBUILD_GUI=OFF
+cmake --build build-harmonic -j$(nproc)
+
+# Gazebo Jetty
+cmake -S . -B build-jetty -DGZ_DISTRO=jetty -DBUILD_GUI=OFF
+cmake --build build-jetty -j$(nproc)
+
+# Gazebo Classic 11
+cmake -S . -B build-classic -DGZ_DISTRO=classic -DBUILD_GUI=OFF
+cmake --build build-classic -j$(nproc)
 ```
 
-Launch Gazebo or PX4 from the same terminal. You can increase `-j2` if you have enough memory for more parallel compiler jobs.
+Reduce the parallel job count on machines with limited RAM.
+
+The build helper uses the same separate build directories and defaults to GUI
+disabled:
+
+```bash
+./build.sh harmonic
+./build.sh jetty
+./build.sh classic
+JOBS=2 BUILD_GUI=ON ./build.sh jetty
+```
+
+Classic always builds without the modern GUI plugin. Release maintainers can
+follow [docs/releasing.md](docs/releasing.md) to tag a version and package each
+backend in its matching clean environment.
+
+Harmonic and Jetty each produce `libgz-dynamic-terrain-core.so` and
+`libgz-dynamic-terrain-system.so`. The `custom::DynamicTerrainSystem` and
+`custom::DynamicTerrainConfig` plugin aliases and existing model SDF syntax are
+preserved. Keep both libraries together. The optional GUI library must come from
+the same build.
+
+Classic produces the shared `libgz-dynamic-terrain-core.so`, the world plugin
+`libgazebo-classic-dynamic-terrain.so`, and the rendering plugin
+`libgazebo-classic-dynamic-terrain-visual.so`, plus
+`libdynamic-terrain-classic-adapter.so` for shared Classic transport/schema code.
+Keep all four together.
+
+Set the appropriate plugin search path in the terminal launching the simulator:
+
+```bash
+# Replace build-harmonic with build-jetty for Jetty.
+export GZ_SIM_SYSTEM_PLUGIN_PATH="$PWD/build-harmonic${GZ_SIM_SYSTEM_PLUGIN_PATH:+:$GZ_SIM_SYSTEM_PLUGIN_PATH}"
+# Classic:
+export GAZEBO_PLUGIN_PATH="$PWD/build-classic${GAZEBO_PLUGIN_PATH:+:$GAZEBO_PLUGIN_PATH}"
+```
+
+For optional modern GUI previews also add the build directory to
+`GZ_GUI_PLUGIN_PATH`. `cmake --install <build-dir> --prefix <prefix>` installs the
+selected libraries and core headers. The external GT installer is unchanged.
+
+See [docs/architecture.md](docs/architecture.md) for the backend and shared-core design.
+The following server/model setup applies to Harmonic and Jetty; Classic setup is
+below. Equivalent modern snippets are in
+[examples/harmonic](examples/harmonic/plugin_snippet.sdf) and
+[examples/jetty](examples/jetty/plugin_snippet.sdf); the original example paths
+remain available.
 
 ## Server setup
 
@@ -106,7 +183,7 @@ Only list cameras that exist. The renderer waits until all listed cameras are av
 
 The example uses a 7.5 km terrain radius and concentrates detailed imagery around the terrain patch below the aircraft. Despite its name, `bottom_camera_only` selects a ground-distance region, not the exact footprint or direction of a camera.
 
-For video streaming, the separate [GstPlaneCameraSystem plugin](https://github.com/syvixi/px4-gazebo-gstreamer-camera-plugin) can be used with the same cameras. It is not required by the terrain plugin.
+For video streaming, the separate [GstPlaneCameraSystem plugin](https://github.com/Xovium-Tech/px4-gazebo-gstreamer-camera-plugin) can be used with the same cameras. It is not required by the terrain plugin.
 
 ## Start the simulation
 
@@ -279,38 +356,60 @@ Mapbox Terrain-RGB can return a non-image response for [tiles entirely over ocea
 
 Keep tokens out of published SDF files and shared logs. Check your provider's access, caching, attribution, and usage requirements before downloading an area. The project's BSD license covers the plugin, not third-party map data.
 
-## Tests and measured results
+## Classic setup
 
-Run the terrain regression tests after building:
+Load the world plugin under `<world>`, with `<tracked_model>` naming the model to
+follow. Put the same terrain configuration element names used above directly
+inside this world plugin. The complete
+[Classic example](examples/classic/plugin_snippet.world) includes a geographic
+origin and camera model:
 
-```bash
-ctest --test-dir build --output-on-failure \
-    -R '^(terrain_types|terrain_builder_mapping|ogre2_resource_lifecycle|example_plugin_filenames)$'
+```xml
+<plugin name="dynamic_terrain" filename="libgazebo-classic-dynamic-terrain.so">
+  <tracked_model>vehicle</tracked_model>
+  <imagery_provider>google_satellite</imagery_provider>
+  <elevation_provider>terrarium</elevation_provider>
+</plugin>
 ```
 
-All four passed on September 5, 2026. The tests use synthetic data without downloading map tiles. Coverage includes:
+The world plugin inserts a visual anchor which loads the Ogre1 visual plugin in
+rendering processes. Classic transport passes the same core-generated terrain
+mesh/image data to the renderer. Headless collision generation is independent
+of the GUI. Run `gazebo examples/classic/plugin_snippet.world`, or `gzserver`
+for a server-only run, after setting `GAZEBO_PLUGIN_PATH`.
 
-- 56 coordinate round trips across two geographic origins and four headings, at horizontal distances up to 100 km, with an error tolerance below 1 mm. This checks coordinate conversion, not the absolute accuracy of map data.
-- Texture coordinates and collision alignment, plus five image-cache configurations exercised over 40 pages each. The 128 MiB cache case holds at most ten 2048 × 2048 RGB images (120 MiB of pixel data); replaced and evicted images must be released.
-- Ogre2 resource cleanup over 20 terrain generations, eviction and reload during 20 camera turns, and 39 checked mountain-scene frames across terrain transitions.
-- Plugin library names in the SDF and server examples.
+Classic uses triangle-mesh collisions generated from the same 16-bit heightmap
+samples; its native image-heightmap loader does not support that precision.
+`heightmap_size` controls the collision grid in both adapters. Large grids cost
+more mesh memory and insertion time in Classic than the modern heightmap path.
 
-Measured with a Release build on Ubuntu 24.04, Intel Core i7-13700HX, GCC 13.3, Gazebo Sim 8.11.0, Rendering 8.2.3, and OpenCV 4.9.0:
+## Tests
 
-| Test executable | Median wall time, 5 runs | Highest peak RSS, 5 runs |
-| --- | ---: | ---: |
-| `dynamic-terrain-types-test` | 0.02 s | 43.9 MiB |
-| `dynamic-terrain-builder-test` | 3.18 s | 233.5 MiB |
-| `dynamic-terrain-ogre2-lifecycle-test` | 0.62 s | 548.1 MiB |
-
-These are short regression-test measurements, not flight FPS, GPU benchmarks, or proof of long-running memory stability. RSS includes the entire test process and its libraries. The renderer test uses software OpenGL; CTest reports it as skipped if a rendering engine or scene cannot be created.
-
-To repeat a measurement, run the following five times, changing the executable name for each test:
+The core suite builds without Gazebo installed:
 
 ```bash
-LIBGL_ALWAYS_SOFTWARE=1 /usr/bin/time -f 'wall=%e s peak_RSS=%M KiB' \
-    ./build/dynamic-terrain-builder-test
+cmake -S . -B build-core -DBUILD_SIMULATOR=OFF -DBUILD_GUI=OFF -DBUILD_TESTING=ON
+cmake --build build-core -j$(nproc)
+ctest --test-dir build-core --output-on-failure
 ```
+
+It covers tile conversion and bounds, URL/cache paths, elevation decoding,
+mesh indexing and normals, collision patch geometry, LOD/page order, cache
+limits, headless worker operation and immutable snapshot handoff. A boundary
+check rejects simulator headers/types in the core.
+
+Each simulator build also supports `ctest --test-dir <build-dir> --output-on-failure`.
+With Ubuntu 20.04's older CTest, use `(cd build-classic && ctest --output-on-failure)`.
+Modern tests include geographic round trips, plugin alias loading, SDF
+configuration, collision insertion and startup-ground retirement, and preview
+transport. Set `BUILD_RENDER_TESTS=ON` to run the preserved Ogre2 texture/mesh
+lifecycle, camera eviction and image-continuity tests; GUI builds additionally
+exercise preview plugin loading and teardown. These require a working rendering
+context (CI uses Xvfb/software OpenGL).
+
+See [validation results and limits](docs/validation.md) for checks actually run
+for this release. Compilation, component smoke tests and short rendering tests
+do not establish compatibility with every world or long-running flight.
 
 ## Troubleshooting
 
@@ -326,4 +425,3 @@ LIBGL_ALWAYS_SOFTWARE=1 /usr/bin/time -f 'wall=%e s peak_RSS=%M KiB' \
 ## License
 
 BSD 3-Clause. Copyright (c) 2026 Alex Chazov. See [LICENSE](LICENSE).
-

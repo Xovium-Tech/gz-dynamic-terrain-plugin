@@ -1,6 +1,6 @@
 #include "Ogre2ResourceCleanup.hh"
-#include "PersistentTerrain.hh"
-#include "TerrainTypes.hh"
+#include "dynamic_terrain/adapters/gzsim/GzTerrainRenderer.hh"
+#include "dynamic_terrain/core/TerrainTypes.hh"
 
 #include <gz/common/Image.hh>
 #include <gz/common/Mesh.hh>
@@ -140,13 +140,13 @@ struct RenderCleanup
     std::string meshName;
 };
 
-std::shared_ptr<gz::common::Image> solidImage(std::uint8_t value)
+std::shared_ptr<const dynamic_terrain::ImageData> solidImage(std::uint8_t value)
 {
     constexpr unsigned int side = 64;
-    std::vector<std::uint8_t> rgb(side * side * 3u, value);
-    auto image = std::make_shared<gz::common::Image>();
-    image->SetFromData(rgb.data(), side, side,
-                       gz::common::Image::RGB_INT8);
+    auto image = std::make_shared<dynamic_terrain::ImageData>();
+    image->width = side;
+    image->height = side;
+    image->rgb.assign(side * side * 3u, value);
     CHECK(image->Valid());
     return image;
 }
@@ -154,7 +154,7 @@ std::shared_ptr<gz::common::Image> solidImage(std::uint8_t value)
 dynamic_terrain::TerrainPage makeTerrainPage(
     const std::string &prefix, const dynamic_terrain::TileKey &key,
     std::size_t index, double minimumX, double maximumX,
-    std::uint8_t imageValue)
+    std::uint8_t imageValue, std::uint64_t generation = 1u)
 {
     dynamic_terrain::TerrainPage page;
     page.key = key;
@@ -166,25 +166,17 @@ dynamic_terrain::TerrainPage makeTerrainPage(
     page.textureName = prefix + "_page_z" + std::to_string(key.z) +
         "_x" + std::to_string(key.x) + "_y" + std::to_string(key.y) +
         "_q14_s64";
-    page.mesh = std::make_shared<gz::common::Mesh>();
-    page.mesh->SetName(prefix + "_mesh_g1_z" + std::to_string(key.z) +
-        "_x" + std::to_string(key.x) + "_y" + std::to_string(key.y));
-    auto surface = std::make_unique<gz::common::SubMesh>(page.submeshName);
-    surface->SetPrimitiveType(gz::common::SubMesh::TRIANGLES);
-    const std::array<gz::math::Vector3d, 4> vertices{{
-        {minimumX, -4.0, 0.0}, {maximumX, -4.0, 0.0},
-        {minimumX, 4.0, 0.0}, {maximumX, 4.0, 0.0}}};
-    const std::array<gz::math::Vector2d, 4> uvs{{
-        {0.0, 0.0}, {1.0, 0.0}, {0.0, 1.0}, {1.0, 1.0}}};
-    for (std::size_t i = 0; i < vertices.size(); ++i)
-    {
-        surface->AddVertex(vertices[i]);
-        surface->AddNormal(0.0, 0.0, 1.0);
-        surface->AddTexCoord(uvs[i]);
-    }
-    for (const unsigned int indexValue : {0u, 2u, 1u, 1u, 2u, 3u})
-        surface->AddIndex(indexValue);
-    page.mesh->AddSubMesh(std::move(surface));
+    auto mesh = std::make_shared<dynamic_terrain::MeshData>();
+    mesh->name = prefix + "_mesh_g" + std::to_string(generation) +
+        "_z" + std::to_string(key.z) + "_x" + std::to_string(key.x) +
+        "_y" + std::to_string(key.y);
+    mesh->submeshName = page.submeshName;
+    mesh->positions = {{minimumX, -4.0, 0.0}, {maximumX, -4.0, 0.0},
+                       {minimumX, 4.0, 0.0}, {maximumX, 4.0, 0.0}};
+    mesh->normals.assign(4u, {0.0, 0.0, 1.0});
+    mesh->texCoords = {{0.0, 0.0}, {1.0, 0.0}, {0.0, 1.0}, {1.0, 1.0}};
+    mesh->indices = {0u, 2u, 1u, 1u, 2u, 3u};
+    page.mesh = std::move(mesh);
     return page;
 }
 
@@ -202,8 +194,8 @@ void testRendererRecenters(const gz::rendering::ScenePtr &scene,
     std::string previousMesh;
     std::string sharedTexture;
     std::string previousImportedMaterial;
-    std::weak_ptr<gz::common::Image> previousCpuImage;
-    std::weak_ptr<gz::common::Mesh> previousCpuMesh;
+    std::weak_ptr<const dynamic_terrain::ImageData> previousCpuImage;
+    std::weak_ptr<const dynamic_terrain::MeshData> previousCpuMesh;
 
     gz::sim::EventManager events;
     {
@@ -215,11 +207,10 @@ void testRendererRecenters(const gz::rendering::ScenePtr &scene,
             snapshot->generation = generation;
             snapshot->resourcePrefix = prefix;
             snapshot->centerTile = key;
-            auto page = makeTerrainPage(prefix, key, 0u, 10.0, 20.0, 60u);
-            page.mesh->SetName(prefix + "_mesh_g" +
-                               std::to_string(generation) + "_z14_x100_y100");
+            auto page = makeTerrainPage(prefix, key, 0u, 10.0, 20.0, 60u,
+                                        generation);
             sharedTexture = page.textureName;
-            const std::string nextMesh = page.mesh->Name();
+            const std::string nextMesh = page.mesh->name;
             snapshot->estimatedTextureBytes =
                 dynamic_terrain::mipmappedRgbaBytes(
                     page.textureSize, page.textureSize);
@@ -301,11 +292,10 @@ void testMountainCameraFrames(const gz::rendering::ScenePtr &scene,
         {
             auto page = makeTerrainPage(prefix, {100 + side, 100, 14}, side,
                                         0, 1, 100);
-            page.mesh = std::make_shared<gz::common::Mesh>();
-            page.mesh->SetName(prefix + "_g" + std::to_string(generation) +
-                               "_p" + std::to_string(side));
-            auto surface = std::make_unique<gz::common::SubMesh>(page.submeshName);
-            surface->SetPrimitiveType(gz::common::SubMesh::TRIANGLES);
+            auto mesh = std::make_shared<dynamic_terrain::MeshData>();
+            mesh->name = prefix + "_g" + std::to_string(generation) +
+                "_p" + std::to_string(side);
+            mesh->submeshName = page.submeshName;
             constexpr int cells = 32;
             for (int y = 0; y <= cells; ++y)
                 for (int x = 0; x <= cells; ++x)
@@ -314,9 +304,9 @@ void testMountainCameraFrames(const gz::rendering::ScenePtr &scene,
                     const double wy = -3000.0 + 6000.0 * y / cells;
                     const double wz = 400 + 200 * std::sin(wx / 300) *
                                                 std::cos(wy / 400);
-                    surface->AddVertex(wx, wy, wz);
-                    surface->AddNormal(0, 0, 1);
-                    surface->AddTexCoord(double(x) / cells, double(y) / cells);
+                    mesh->positions.emplace_back(wx, wy, wz);
+                    mesh->normals.emplace_back(0, 0, 1);
+                    mesh->texCoords.emplace_back(double(x) / cells, double(y) / cells);
                 }
             for (int y = 0; y < cells; ++y)
                 for (int x = 0; x < cells; ++x)
@@ -324,9 +314,9 @@ void testMountainCameraFrames(const gz::rendering::ScenePtr &scene,
                     const unsigned int a = y * (cells + 1) + x;
                     const unsigned int b = a + 1, c = a + cells + 1, d = c + 1;
                     for (auto i : {a, b, c, b, d, c})
-                        surface->AddIndex(i);
+                        mesh->indices.push_back(i);
                 }
-            page.mesh->AddSubMesh(std::move(surface));
+            page.mesh = std::move(mesh);
             snapshot->pages.push_back(std::move(page));
         }
         renderer.QueueSnapshot(snapshot);
@@ -389,8 +379,8 @@ void testCameraResidency(const gz::rendering::ScenePtr &scene,
             dynamic_terrain::mipmappedRgbaBytes(
                 page.textureSize, page.textureSize);
 
-    const std::string frontMesh = snapshot->pages[0].mesh->Name();
-    const std::string backMesh = snapshot->pages[1].mesh->Name();
+    const std::string frontMesh = snapshot->pages[0].mesh->name;
+    const std::string backMesh = snapshot->pages[1].mesh->name;
     const std::string frontTexture = snapshot->pages[0].textureName;
     const std::string backTexture = snapshot->pages[1].textureName;
 
@@ -497,7 +487,7 @@ void testCameraResidency(const gz::rendering::ScenePtr &scene,
 int runTest()
 {
     std::map<std::string, std::string> parameters;
-    auto *engine = gz::rendering::engine("ogre2", parameters);
+    auto *engine = gz::rendering::engine(TERRAIN_RENDER_ENGINE_LIBRARY, parameters);
     if (!engine)
     {
         std::cerr << "SKIP: Ogre2 render engine is unavailable\n";

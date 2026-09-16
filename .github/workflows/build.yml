@@ -1,0 +1,95 @@
+name: Build and smoke test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  core:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install simulator-independent dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build g++ libcurl4-openssl-dev libopencv-dev
+      - name: Build without Gazebo
+        run: |
+          cmake -S . -B build-core -G Ninja -DBUILD_SIMULATOR=OFF -DBUILD_GUI=OFF -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-core --parallel 2
+          ctest --test-dir build-core --output-on-failure
+
+  modern:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: [harmonic, jetty]
+        gui: ['OFF', 'ON']
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install selected Gazebo release
+        env:
+          DISTRO: ${{ matrix.distro }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl gnupg cmake ninja-build g++ libcurl4-openssl-dev libopencv-dev protobuf-compiler libprotobuf-dev xvfb libgl1-mesa-dri
+          sudo curl -fsSL https://packages.osrfoundation.org/gazebo.gpg -o /usr/share/keyrings/gazebo-archive-keyring.gpg
+          echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/gazebo-archive-keyring.gpg] https://packages.osrfoundation.org/gazebo/ubuntu-stable noble main' | sudo tee /etc/apt/sources.list.d/gazebo-stable.list
+          sudo apt-get update
+          if [ "$DISTRO" = harmonic ]; then
+            sudo apt-get install -y gz-harmonic libgz-sim8-dev libgz-rendering8-ogre2-dev libgz-gui8-dev qml-module-qtquick-controls qml-module-qtquick-controls2 qml-module-qtquick-layouts
+          else
+            sudo apt-get install -y gz-jetty libgz-sim10-dev libgz-rendering10-ogre2-dev libgz-gui10-dev qml6-module-qtquick-controls qml6-module-qtquick-dialogs qml6-module-qtquick-layouts qml6-module-qtquick-window qml6-module-qtquick-templates qml6-module-qtqml-workerscript
+          fi
+      - name: Configure and compile
+        env:
+          DISTRO: ${{ matrix.distro }}
+          GUI: ${{ matrix.gui }}
+        run: |
+          cmake -S . -B "build-$DISTRO" -G Ninja -DGZ_DISTRO="$DISTRO" -DBUILD_GUI="$GUI" -DBUILD_RENDER_TESTS=ON -DCMAKE_BUILD_TYPE=Release
+          cmake --build "build-$DISTRO" --parallel 2
+      - name: Core, plugin loading, transport, and rendering smoke tests
+        env:
+          DISTRO: ${{ matrix.distro }}
+        run: xvfb-run -a env LIBGL_ALWAYS_SOFTWARE=1 ctest --test-dir "build-$DISTRO" --output-on-failure
+      - name: Check stable plugin artifacts
+        env:
+          DISTRO: ${{ matrix.distro }}
+          GUI: ${{ matrix.gui }}
+        run: |
+          test -f "build-$DISTRO/libgz-dynamic-terrain-core.so"
+          test -f "build-$DISTRO/libgz-dynamic-terrain-system.so"
+          if [ "$GUI" = ON ]; then test -f "build-$DISTRO/libDynamicTerrainGui.so"; fi
+
+  classic:
+    runs-on: ubuntu-24.04
+    container: ubuntu:20.04
+    env:
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install isolated Classic 11 dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl gnupg
+          curl -fsSL https://packages.osrfoundation.org/gazebo.gpg -o /usr/share/keyrings/gazebo-archive-keyring.gpg
+          echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/gazebo-archive-keyring.gpg] https://packages.osrfoundation.org/gazebo/ubuntu-stable focal main' > /etc/apt/sources.list.d/gazebo-stable.list
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates cmake ninja-build g++ gazebo11 libgazebo11-dev libcurl4-openssl-dev libopencv-dev protobuf-compiler libprotobuf-dev xvfb xauth libgl1-mesa-dri
+      - name: Configure and compile Classic 11
+        run: |
+          cmake -S . -B build-classic -G Ninja -DGZ_DISTRO=classic -DBUILD_GUI=OFF -DBUILD_RENDER_TESTS=ON -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-classic --parallel 2
+          cd build-classic
+          xvfb-run -a env LIBGL_ALWAYS_SOFTWARE=1 ctest --output-on-failure
+      - name: Check Classic plugin artifacts
+        run: |
+          test -f build-classic/libgz-dynamic-terrain-core.so
+          test -f build-classic/libdynamic-terrain-classic-adapter.so
+          test -f build-classic/libgazebo-classic-dynamic-terrain.so
+          test -f build-classic/libgazebo-classic-dynamic-terrain-visual.so

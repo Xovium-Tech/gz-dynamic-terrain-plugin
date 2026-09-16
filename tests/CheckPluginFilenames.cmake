@@ -1,6 +1,7 @@
-file(GLOB terrain_example_files
+file(GLOB_RECURSE terrain_example_files
     "${EXAMPLES_DIR}/*.sdf"
-    "${EXAMPLES_DIR}/*.config")
+    "${EXAMPLES_DIR}/*.config"
+    "${EXAMPLES_DIR}/*.world")
 
 set(found_plugin FALSE)
 foreach(example_file IN LISTS terrain_example_files)
@@ -17,4 +18,21 @@ endforeach()
 if(NOT found_plugin)
     message(FATAL_ERROR
         "No example references libgz-dynamic-terrain-system.so")
+endif()
+
+foreach(distro harmonic jetty)
+    set(snippet "${EXAMPLES_DIR}/${distro}/plugin_snippet.sdf")
+    if(NOT EXISTS "${snippet}")
+        message(FATAL_ERROR "Missing ${distro} example")
+    endif()
+    file(READ "${snippet}" contents)
+    if(NOT contents MATCHES "custom::DynamicTerrainConfig" OR
+       NOT contents MATCHES "libgz-dynamic-terrain-system\\.so")
+        message(FATAL_ERROR "${snippet} does not preserve the modern plugin contract")
+    endif()
+endforeach()
+file(READ "${EXAMPLES_DIR}/classic/plugin_snippet.world" classic_contents)
+if(NOT classic_contents MATCHES "libgazebo-classic-dynamic-terrain\\.so" OR
+   NOT classic_contents MATCHES "<tracked_model>")
+    message(FATAL_ERROR "Classic example must load its world plugin and name the tracked model")
 endif()

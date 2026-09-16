@@ -7,6 +7,7 @@
 #include <gazebo/physics/MeshShape.hh>
 #include <gazebo/physics/Model.hh>
 #include <gazebo/physics/World.hh>
+#include <gazebo/transport/TransportIface.hh>
 
 #include <fstream>
 #include <iomanip>
@@ -174,7 +175,14 @@ void ClassicCollisionAdapter::Update(double simTime)
         if (world_->ModelByName(it->name))
         {
             it->seen = true;
-            world_->RemoveModel(it->name);
+            if (!it->removalRequested)
+            {
+                // World::RemoveModel bypasses the mutex protecting LogWorker's
+                // link snapshots. The native request queue takes that mutex
+                // before finalizing links, and does not block this update.
+                gazebo::transport::requestNoReply(world_->Name(), "entity_delete", it->name);
+                it->removalRequested = true;
+            }
             ++it;
         }
         else if (it->seen)
@@ -198,13 +206,18 @@ bool ClassicCollisionAdapter::ConsumeInsertionFailure()
 
 void ClassicCollisionAdapter::RemoveAll()
 {
-    if (!active_.empty()) world_->RemoveModel(active_);
-    if (pending_) world_->RemoveModel(pending_->name);
-    for (const auto &retiring : retiring_) world_->RemoveModel(retiring.name);
+    if (!active_.empty())
+        gazebo::transport::requestNoReply(world_->Name(), "entity_delete", active_);
+    if (pending_)
+        gazebo::transport::requestNoReply(world_->Name(), "entity_delete", pending_->name);
+    for (const auto &retiring : retiring_)
+        if (!retiring.removalRequested)
+            gazebo::transport::requestNoReply(world_->Name(), "entity_delete", retiring.name);
     active_.clear();
     pending_.reset();
     waiting_.reset();
     retiring_.clear();
-    for (auto &slot : slots_) slot.owner.clear();
+    // This is terminal cleanup. Keep mesh slots reserved until destruction;
+    // their native models remain live until the world handles these requests.
 }
 }

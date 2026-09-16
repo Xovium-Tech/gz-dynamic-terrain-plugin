@@ -85,7 +85,9 @@ jobs:
         run: |
           cmake -S . -B build-classic -G Ninja -DGZ_DISTRO=classic -DBUILD_GUI=OFF -DBUILD_RENDER_TESTS=ON -DCMAKE_BUILD_TYPE=Release
           cmake --build build-classic --parallel 2
-          cd build-classic
+      - name: Classic core, physics, transport, and rendering smoke tests
+        working-directory: build-classic
+        run: |
           xvfb-run -a env LIBGL_ALWAYS_SOFTWARE=1 ctest --output-on-failure
       - name: Check Classic plugin artifacts
         run: |

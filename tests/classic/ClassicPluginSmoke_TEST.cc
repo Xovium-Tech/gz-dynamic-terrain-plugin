@@ -1,11 +1,13 @@
 #include "dynamic_terrain/core/TileStore.hh"
 #include "dynamic_terrain/adapters/classic/ClassicGeographicTransform.hh"
+#include "ClassicWorldStepper.hh"
 
 #include <gazebo/gazebo.hh>
 #include <gazebo/physics/Collision.hh>
 #include <gazebo/physics/Link.hh>
 #include <gazebo/physics/Model.hh>
 #include <gazebo/physics/World.hh>
+#include <gazebo/util/LogRecord.hh>
 #include <opencv2/imgcodecs.hpp>
 
 #include <chrono>
@@ -50,6 +52,7 @@ int main()
         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     bool serverStarted = false;
     gazebo::physics::WorldPtr world;
+    std::unique_ptr<ClassicWorldStepper> stepper;
     try
     {
         Config cfg;
@@ -104,53 +107,96 @@ int main()
         unsetenv("DISPLAY");
         CHECK(gazebo::setupServer());
         serverStarted = true;
+        CHECK(gazebo::util::LogRecord::Instance()->Init("terrain_classic_smoke"));
         world = gazebo::loadWorld(filename.string());
         CHECK(world);
         // The standalone library caller replaces gzserver's sensor loop; this
         // fixture contains no sensors and can release the world-plugin barrier.
         world->_SetSensorsInitialized(true);
         world->SetPaused(false);
+        // Keep native state snapshots active throughout retirement, rather than
+        // exercising only LogWorker's initial snapshot at world startup.
+        gazebo::util::LogRecord::Instance()->SetPeriod(0.005);
+        CHECK(gazebo::util::LogRecord::Instance()->Start("txt", (cache / "log").string()));
+        stepper = std::make_unique<ClassicWorldStepper>(world);
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
         std::set<std::string> first;
         while (std::chrono::steady_clock::now() < deadline)
         {
-            gazebo::runWorld(world, 10);
+            stepper->Step(10);
             first = livePatches(world);
-            if (!first.empty() && !safetyPresent(world)) break;
+            if (first.size() == 1 && !safetyPresent(world)) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
         CHECK(first.size() == 1 && !safetyPresent(world));
         const auto probe = world->ModelByName("probe");
         CHECK(probe);
-        gazebo::runWorld(world, 400);
+        // Async startup may take arbitrary simulation time. Begin the contact
+        // check from a known drop after terrain is live and safety has retired.
+        probe->SetWorldPose(ignition::math::Pose3d(0, 0, 2, 0, 0, 0));
+        probe->SetLinearVel(ignition::math::Vector3d::Zero);
+        probe->SetAngularVel(ignition::math::Vector3d::Zero);
+        stepper->Step(400);
         // This probe is supported by the generated terrain mesh after startup
         // ground has gone, exercising ODE contact rather than model names alone.
         CHECK(probe->WorldPose().Pos().Z() > 0.8 && probe->WorldPose().Pos().Z() < 1.2);
 
         const auto aircraft = world->ModelByName("aircraft");
         CHECK(aircraft);
-        aircraft->SetWorldPose(ignition::math::Pose3d(500, 0, 10, 0, 0, 0));
-        bool replaced = false;
-        bool overlapObserved = false;
-        const auto recenterDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
-        while (std::chrono::steady_clock::now() < recenterDeadline)
+        // Repeated replacement exercises native LogWorker snapshots concurrently
+        // with retirement, and cycles through the bounded collision mesh slots.
+        auto previous = livePatches(world);
+        CHECK(!previous.empty());
+        for (const double x : {500.0, -500.0, 500.0, -500.0})
         {
-            gazebo::runWorld(world, 10);
-            const auto patches = livePatches(world);
-            overlapObserved = overlapObserved || patches.size() >= 2;
-            if (patches.size() == 1 && patches != first) { replaced = true; break; }
+            aircraft->SetWorldPose(ignition::math::Pose3d(x, 0, 10, 0, 0, 0));
+            bool replaced = false;
+            bool overlapObserved = false;
+            const auto recenterDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+            while (std::chrono::steady_clock::now() < recenterDeadline)
+            {
+                stepper->Step(10);
+                const auto patches = livePatches(world);
+                overlapObserved = overlapObserved || patches.size() >= 2;
+                if (patches.size() == 1 && patches != previous)
+                {
+                    previous = patches;
+                    replaced = true;
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            CHECK(replaced && overlapObserved);
+        }
+
+        // The simulation thread is parked, but the world remains live. Unload
+        // exercises plugin cleanup separately from World::Fini's own teardown.
+        world->RemovePlugin("dynamic_terrain");
+        const auto cleanupDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        bool cleaned = false;
+        while (std::chrono::steady_clock::now() < cleanupDeadline)
+        {
+            stepper->Step(10);
+            cleaned = true;
+            for (const auto &model : world->Models())
+                if (model->GetName().find("dynamic_terrain_classic_") == 0) cleaned = false;
+            if (cleaned) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
-        CHECK(replaced && overlapObserved);
+        CHECK(cleaned);
+        stepper.reset();
+        gazebo::util::LogRecord::Instance()->Stop();
         world.reset();
         CHECK(gazebo::shutdown());
         serverStarted = false;
         fs::remove_all(cache);
-        std::cout << "Classic plugin loading, offline terrain, ODE terrain contact, safety retirement and recenter passed\n";
+        std::cout << "Classic plugin loading, offline terrain, ODE contact, repeated recenter and live cleanup passed\n";
         return 0;
     }
     catch (const std::exception &error)
     {
+        stepper.reset();
+        if (serverStarted) gazebo::util::LogRecord::Instance()->Stop();
         world.reset();
         if (serverStarted) gazebo::shutdown();
         fs::remove_all(cache);

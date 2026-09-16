@@ -1,4 +1,5 @@
 #include "dynamic_terrain/adapters/classic/ClassicCollisionAdapter.hh"
+#include "ClassicWorldStepper.hh"
 
 #include <gazebo/common/MeshManager.hh>
 #include <gazebo/gazebo.hh>
@@ -24,6 +25,7 @@ int main()
         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     gazebo::physics::WorldPtr world;
     std::unique_ptr<ClassicCollisionAdapter> adapter;
+    std::unique_ptr<ClassicWorldStepper> stepper;
     bool serverStarted = false;
     try
     {
@@ -47,6 +49,7 @@ int main()
         CHECK(world);
         world->_SetSensorsInitialized(true);
         world->SetPaused(false);
+        stepper = std::make_unique<ClassicWorldStepper>(world);
         adapter = std::make_unique<ClassicCollisionAdapter>(world, "pool", directory / "meshes");
         const auto probe = world->ModelByName("probe");
         CHECK(probe);
@@ -65,7 +68,7 @@ int main()
             while (std::chrono::steady_clock::now() < deadline)
             {
                 adapter->Update(world->SimTime().Double());
-                gazebo::runWorld(world, 10);
+                stepper->Step(10);
                 std::set<std::string> names;
                 for (const auto &model : world->Models())
                     if (model->GetName().find("pool_collision_") == 0) names.insert(model->GetName());
@@ -82,7 +85,7 @@ int main()
             probe->SetWorldPose(ignition::math::Pose3d(0, 0, surface + 1.0, 0, 0, 0));
             probe->SetLinearVel(ignition::math::Vector3d::Zero);
             probe->SetAngularVel(ignition::math::Vector3d::Zero);
-            gazebo::runWorld(world, 300);
+            stepper->Step(300);
             CHECK(std::abs(probe->WorldPose().Pos().Z() - (surface + 0.25)) < 0.03);
         }
         // Hold retirement time while factory insertions finish, filling all
@@ -96,7 +99,7 @@ int main()
             while (adapter->HasPending() && std::chrono::steady_clock::now() < deadline)
             {
                 adapter->Update(heldTime);
-                gazebo::runWorld(world, 1);
+                stepper->Step(1);
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }
             CHECK(!adapter->HasPending());
@@ -111,7 +114,7 @@ int main()
         while (std::chrono::steady_clock::now() < resumeDeadline)
         {
             adapter->Update(world->SimTime().Double());
-            gazebo::runWorld(world, 10);
+            stepper->Step(10);
             std::size_t live = 0;
             for (const auto &model : world->Models())
                 if (model->GetName().find("pool_collision_") == 0) ++live;
@@ -122,7 +125,7 @@ int main()
         probe->SetWorldPose(ignition::math::Pose3d(0, 0, latestSurface + 1.0, 0, 0, 0));
         probe->SetLinearVel(ignition::math::Vector3d::Zero);
         probe->SetAngularVel(ignition::math::Vector3d::Zero);
-        gazebo::runWorld(world, 300);
+        stepper->Step(300);
         CHECK(std::abs(probe->WorldPose().Pos().Z() - (latestSurface + 0.25)) < 0.03);
         std::size_t meshFiles = 0;
         for (const auto &entry : fs::directory_iterator(directory / "meshes"))
@@ -132,8 +135,25 @@ int main()
             CHECK(gazebo::common::MeshManager::Instance()->HasMesh(entry.path().string()));
         }
         CHECK(meshFiles == 3);
+        // Terminal cleanup also covers a factory request whose model has not
+        // appeared yet. Its queued insertion must not leave an orphan behind.
+        CHECK(adapter->Submit(patch, ++generation));
+        CHECK(adapter->HasPending());
         adapter->RemoveAll();
         adapter.reset();
+        const auto cleanupDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        bool cleaned = false;
+        while (std::chrono::steady_clock::now() < cleanupDeadline)
+        {
+            stepper->Step(10);
+            cleaned = true;
+            for (const auto &model : world->Models())
+                if (model->GetName().find("pool_collision_") == 0) cleaned = false;
+            if (cleaned) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        CHECK(cleaned);
+        stepper.reset();
         world.reset();
         CHECK(gazebo::shutdown());
         serverStarted = false;
@@ -144,6 +164,7 @@ int main()
     catch (const std::exception &error)
     {
         adapter.reset();
+        stepper.reset();
         world.reset();
         if (serverStarted) gazebo::shutdown();
         fs::remove_all(directory);

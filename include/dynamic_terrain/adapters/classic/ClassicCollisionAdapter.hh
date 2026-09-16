@@ -23,6 +23,7 @@ public:
     bool HasActive() const;
     bool HasPending() const { return pending_.has_value() || waiting_.has_value(); }
     bool ConsumeInsertionFailure();
+    // Queue terminal cleanup before destruction; do not submit further patches.
     void RemoveAll();
 
 private:
@@ -39,6 +40,7 @@ private:
         double removeAt;
         bool seen{false};
         std::size_t slot{0};
+        bool removalRequested{false};
     };
     struct Waiting { CollisionPatch patch; std::uint64_t generation; };
     struct Slot { fs::path path; std::string owner; };

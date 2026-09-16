@@ -1,5 +1,8 @@
 # Dynamic Terrain Plugin
 
+[![CI](https://github.com/Xovium-Tech/gz-dynamic-terrain-plugin/actions/workflows/build.yml/badge.svg?branch=main)](https://github.com/Xovium-Tech/gz-dynamic-terrain-plugin/actions/workflows/build.yml)
+[![Latest release](https://img.shields.io/github/v/release/Xovium-Tech/gz-dynamic-terrain-plugin)](https://github.com/Xovium-Tech/gz-dynamic-terrain-plugin/releases/latest)
+
 Stream map imagery and elevation terrain around a moving model in **Gazebo
 Harmonic, Jetty or Classic 11**. One shared terrain engine handles tile downloads,
 caching, mesh generation, collision terrain and progressive texture detail.

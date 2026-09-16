@@ -9,6 +9,7 @@
 #include <gazebo/common/UpdateInfo.hh>
 #include <gazebo/physics/Model.hh>
 #include <gazebo/physics/World.hh>
+#include <gazebo/transport/TransportIface.hh>
 
 #include <atomic>
 #include <chrono>
@@ -30,16 +31,18 @@ public:
         // All worker publication finishes before its transport sink disappears.
         runtime_.reset();
         source_.reset();
-        // World::Fini marks the world stopped and clears its SDF before
-        // destroying plugins. It owns entity teardown at that point;
-        // RemoveModel would dereference the already-reset SDF.
+        // World::Fini marks the world stopped before destroying plugins and
+        // owns entity teardown at that point. A live world handles cleanup
+        // through its deletion queue, synchronized with native state readers.
         const bool worldStillLive = world_ && world_->Running();
         if (collision_ && worldStillLive) collision_->RemoveAll();
         collision_.reset();
         if (worldStillLive)
         {
-            if (!safetyName_.empty()) world_->RemoveModel(safetyName_);
-            if (!anchorName_.empty()) world_->RemoveModel(anchorName_);
+            if (!safetyName_.empty())
+                gazebo::transport::requestNoReply(world_->Name(), "entity_delete", safetyName_);
+            if (!anchorName_.empty())
+                gazebo::transport::requestNoReply(world_->Name(), "entity_delete", anchorName_);
         }
     }
 
@@ -182,6 +185,15 @@ private:
     void UpdateSafetyGround(double simTime, double vehicleZ)
     {
         if (safetyName_.empty() || safetyRemoved_) return;
+        if (safetyRemovalRequested_)
+        {
+            if (!world_->ModelByName(safetyName_))
+            {
+                safetyRemoved_ = true;
+                logInfo("[DynamicTerrain][CLASSIC] startup safety removed; terrain collision live");
+            }
+            return;
+        }
         if (!collision_->HasActive() || vehicleZ < cfg_.startupSafetyTopZ - 0.5)
         {
             readySince_ = -1.0;
@@ -192,9 +204,8 @@ private:
         // Do not drop the pending safety model's name before factory insertion.
         if (world_->ModelByName(safetyName_))
         {
-            world_->RemoveModel(safetyName_);
-            safetyRemoved_ = true;
-            logInfo("[DynamicTerrain][CLASSIC] startup safety removed; terrain collision live");
+            gazebo::transport::requestNoReply(world_->Name(), "entity_delete", safetyName_);
+            safetyRemovalRequested_ = true;
         }
     }
 
@@ -220,6 +231,7 @@ private:
     std::unique_ptr<TerrainRuntime> runtime_;
     std::string anchorName_, safetyName_;
     bool safetyRemoved_{false};
+    bool safetyRemovalRequested_{false};
     bool trackedWasAvailable_{false};
     bool retryCollision_{false};
     double readySince_{-1.0};

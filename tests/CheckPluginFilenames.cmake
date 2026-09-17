@@ -31,8 +31,3 @@ foreach(distro harmonic jetty)
         message(FATAL_ERROR "${snippet} does not preserve the modern plugin contract")
     endif()
 endforeach()
-file(READ "${EXAMPLES_DIR}/classic/plugin_snippet.world" classic_contents)
-if(NOT classic_contents MATCHES "libgazebo-classic-dynamic-terrain\\.so" OR
-   NOT classic_contents MATCHES "<tracked_model>")
-    message(FATAL_ERROR "Classic example must load its world plugin and name the tracked model")
-endif()

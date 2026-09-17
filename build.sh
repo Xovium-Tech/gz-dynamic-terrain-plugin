@@ -7,14 +7,13 @@ BUILD_GUI="${BUILD_GUI:-OFF}"
 BUILD_TESTING="${BUILD_TESTING:-OFF}"
 
 if (( $# > 1 )); then
-    echo "Usage: $0 [harmonic|jetty|classic]" >&2
+    echo "Usage: $0 [harmonic|jetty]" >&2
     exit 2
 fi
 case "$DISTRO" in
     harmonic|jetty) ;;
-    classic) BUILD_GUI=OFF ;;
     *)
-        echo "Usage: $0 [harmonic|jetty|classic]" >&2
+        echo "Usage: $0 [harmonic|jetty]" >&2
         exit 2
         ;;
 esac
@@ -51,24 +50,13 @@ cmake -S "$ROOT" -B "$BUILD_DIR" \
 cmake --build "$BUILD_DIR" --parallel "$JOBS"
 
 printf '\nBuild complete: %s\n\nPlugin search paths:\n' "$BUILD_DIR"
-if [[ "$DISTRO" == classic ]]; then
-    printf 'export GAZEBO_PLUGIN_PATH=%q"${GAZEBO_PLUGIN_PATH:+:$GAZEBO_PLUGIN_PATH}"\n' "$BUILD_DIR"
-else
-    printf 'export GZ_SIM_SYSTEM_PLUGIN_PATH=%q"${GZ_SIM_SYSTEM_PLUGIN_PATH:+:$GZ_SIM_SYSTEM_PLUGIN_PATH}"\n' "$BUILD_DIR"
-    if [[ "$BUILD_GUI" == ON ]]; then
-        printf 'export GZ_GUI_PLUGIN_PATH=%q"${GZ_GUI_PLUGIN_PATH:+:$GZ_GUI_PLUGIN_PATH}"\n' "$BUILD_DIR"
-    fi
+printf 'export GZ_SIM_SYSTEM_PLUGIN_PATH=%q"${GZ_SIM_SYSTEM_PLUGIN_PATH:+:$GZ_SIM_SYSTEM_PLUGIN_PATH}"\n' "$BUILD_DIR"
+if [[ "$BUILD_GUI" == ON ]]; then
+    printf 'export GZ_GUI_PLUGIN_PATH=%q"${GZ_GUI_PLUGIN_PATH:+:$GZ_GUI_PLUGIN_PATH}"\n' "$BUILD_DIR"
 fi
 
 printf '\nLibraries (keep these together):\n%s/libgz-dynamic-terrain-core.so\n' "$BUILD_DIR"
-if [[ "$DISTRO" == classic ]]; then
-    printf '%s/%s\n' \
-        "$BUILD_DIR" libdynamic-terrain-classic-adapter.so \
-        "$BUILD_DIR" libgazebo-classic-dynamic-terrain.so \
-        "$BUILD_DIR" libgazebo-classic-dynamic-terrain-visual.so
-else
-    printf '%s/libgz-dynamic-terrain-system.so\n' "$BUILD_DIR"
-    if [[ "$BUILD_GUI" == ON ]]; then
-        printf '%s/libDynamicTerrainGui.so\n' "$BUILD_DIR"
-    fi
+printf '%s/libgz-dynamic-terrain-system.so\n' "$BUILD_DIR"
+if [[ "$BUILD_GUI" == ON ]]; then
+    printf '%s/libDynamicTerrainGui.so\n' "$BUILD_DIR"
 fi

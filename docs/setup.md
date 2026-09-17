@@ -1,8 +1,7 @@
 # Simulation setup
 
 Build the plugin for your simulator and set its plugin search path as described
-in the [README](../README.md). The modern setup below applies to Harmonic and
-Jetty; [Classic setup](#classic-setup) uses a world plugin.
+in the [README](../README.md). This setup applies to Gazebo Harmonic and Jetty.
 
 ## Server setup
 
@@ -76,38 +75,9 @@ gz sim -r /path/to/your_world.sdf
 
 The first load takes longer while imagery and elevation tiles download. View the terrain through a camera sensor. With `diagnostics` enabled, messages prefixed with `[DynamicTerrain]` report downloads, terrain updates, and resource usage.
 
-## Classic setup
-
-Load the world plugin under `<world>`, with `<tracked_model>` naming the model to
-follow. Put the same terrain configuration element names used above directly
-inside this world plugin. The complete
-[Classic example](../examples/classic/plugin_snippet.world) includes a geographic
-origin and camera model:
-
-```xml
-<plugin name="dynamic_terrain" filename="libgazebo-classic-dynamic-terrain.so">
-  <tracked_model>vehicle</tracked_model>
-  <imagery_provider>google_satellite</imagery_provider>
-  <elevation_provider>terrarium</elevation_provider>
-</plugin>
-```
-
-The world plugin inserts a visual anchor which loads the Ogre1 visual plugin in
-rendering processes. Classic transport passes the same core-generated terrain
-mesh/image data to the renderer. Headless collision generation is independent
-of the GUI. Run `gazebo examples/classic/plugin_snippet.world`, or `gzserver`
-for a server-only run, after setting `GAZEBO_PLUGIN_PATH`.
-
-Classic uses triangle-mesh collisions generated from the same 16-bit heightmap
-samples; its native image-heightmap loader does not support that precision.
-`heightmap_size` controls the collision grid in both adapters. Large grids cost
-more mesh memory and insertion time in Classic than the modern heightmap path.
-
 ## Troubleshooting
 
 - **Plugin not found:** check that `GZ_SIM_SYSTEM_PLUGIN_PATH` points to the build directory in the terminal that launches Gazebo or PX4. Keep both terrain libraries together.
 - **No terrain:** check the world coordinates, the model configuration block, the Ogre2 Sensors system, and that a camera is active. Look for tile download errors in the server output.
-- **Tiny or displaced Classic terrain:** rebuild the Classic plugin with the metre-scale fix. Older renderers inherited the `0.001` scale of the internal visual anchor, shrinking both the terrain and its distance from the world origin by 1,000. The updated renderer keeps page geometry in world metres; enlarging the world or `uneven_ground` is unnecessary.
 - **Terrain missing at altitude:** check the camera's far clipping distance as well as the visual radius. Increasing either can increase rendering work.
 - **Off-screen memory does not drop:** check camera names first. Cache reuse and allocator behaviour can keep process RSS above the amount of live terrain data, so inspect resource diagnostics as well as system memory.
-

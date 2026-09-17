@@ -5,15 +5,12 @@
 
 namespace dynamic_terrain
 {
-std::string collisionSdf(const CollisionPatch &patch,
-                         std::uint64_t serial, const std::string &version,
-                         const std::string &modelName)
+std::string collisionSdf(const CollisionPatch &patch, std::uint64_t serial)
 {
     std::ostringstream out;
     out << std::setprecision(17)
-        << "<sdf version='" << xmlEscape(version) << "'>"
-        << "<model name='" << xmlEscape(modelName.empty()
-            ? "dynamic_terrain_collision_" + std::to_string(serial) : modelName) << "'>"
+        << "<sdf version='1.9'>"
+        << "<model name='dynamic_terrain_collision_" << serial << "'>"
         << "<static>true</static><link name='ground'>"
         << "<collision name='collision'><pose>"
         << patch.centerX << ' ' << patch.centerY << ' ' << patch.baseZ

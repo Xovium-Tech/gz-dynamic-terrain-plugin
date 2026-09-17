@@ -1,6 +1,6 @@
 # Source-only releases
 
-Publish one source release per version for Harmonic, Jetty and Classic 11.
+Publish one source release per version for Harmonic and Jetty.
 Users install the dependencies and compile the selected backend on their own
 computer, following the [README](../README.md).
 
@@ -47,7 +47,7 @@ git diff --check
 git add -A
 git diff --cached --stat
 git diff --cached --check
-git commit -m "Simplify source-only releases and local builds"
+git commit -m "Remove Gazebo Classic dynamic terrain support"
 git pull --rebase origin main
 git push origin main
 ```
@@ -59,7 +59,7 @@ pull request, push a feature branch and merge through the normal review process.
 
 Wait for **Build and smoke test** to pass on the
 [Actions page](https://github.com/Xovium-Tech/gz-dynamic-terrain-plugin/actions).
-It checks the core, Harmonic GUI OFF/ON, Jetty GUI OFF/ON and Classic 11.
+It checks the core, Harmonic GUI OFF/ON and Jetty GUI OFF/ON.
 
 ```bash
 git switch main
@@ -70,7 +70,7 @@ git log -1 --format='%H %s'
 Confirm that commit passed CI, then create the new tag:
 
 ```bash
-git tag -a v0.2.1 -m "v0.2.1: source-only releases and local builds"
+git tag -a v0.2.1 -m "v0.2.1: source-only terrain for Harmonic and Jetty"
 git push origin v0.2.1
 ```
 
@@ -78,7 +78,7 @@ git push origin v0.2.1
 
 1. Open [Create a new release](https://github.com/Xovium-Tech/gz-dynamic-terrain-plugin/releases/new).
 2. Select the existing `v0.2.1` tag.
-3. Set the title to **v0.2.1 — Source-only release**.
+3. Set the title to **v0.2.1 — Harmonic and Jetty source release**.
 4. Paste [release-notes.md](release-notes.md) into the description.
 5. Leave the binary/file upload field empty.
 6. Publish and mark this as the latest release.

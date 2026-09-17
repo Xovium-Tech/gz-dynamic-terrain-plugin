@@ -2,7 +2,6 @@
 
 #include "dynamic_terrain/core/TerrainTypes.hh"
 #include "dynamic_terrain/core/TileStore.hh"
-#include "dynamic_terrain/core/TerrainData.hh"
 
 #include <filesystem>
 #include <memory>
@@ -24,12 +23,6 @@ struct CollisionPatch
     double sizeZ{0.1};
     double yaw{0.0};
 };
-
-// For backends whose native heightmap loader cannot represent 16-bit samples.
-// Mesh vertices are relative to (centerX, centerY, baseZ), rotated by patch.yaw.
-// Created lazily so heightmap-capable backends retain their original memory use.
-std::shared_ptr<const MeshData> collisionPatchMesh(const CollisionPatch &patch,
-                                                std::string &error);
 
 class CollisionTerrainBuilder
 {

@@ -4,7 +4,7 @@
 [![Latest release](https://img.shields.io/github/v/release/Xovium-Tech/gz-dynamic-terrain-plugin)](https://github.com/Xovium-Tech/gz-dynamic-terrain-plugin/releases/latest)
 
 Stream map imagery and elevation terrain around a moving model in **Gazebo
-Harmonic, Jetty or Classic 11**. One shared terrain engine handles tile downloads,
+Harmonic or Jetty**. One shared terrain engine handles tile downloads,
 caching, mesh generation, collision terrain and progressive texture detail.
 
 [![Watch the terrain demo](https://xovium.tech/media/dynamic-terrain-demo-140cfb8db1ca/preview.gif)](https://xovium.tech/videos/dynamic-terrain/)
@@ -20,18 +20,20 @@ published.
 | --- | --- | --- |
 | `harmonic` | Gazebo Harmonic / gz-sim8 | Ubuntu 24.04 |
 | `jetty` | Gazebo Jetty / gz-sim10 | Ubuntu 24.04 |
-| `classic` | Gazebo Classic 11 | Ubuntu 20.04 |
 
 Choose the target matching your installed simulator. Each target uses a separate
 build directory; compiled libraries are specific to that Gazebo version.
 
+Gazebo Classic dynamic terrain support has been removed. Existing Classic / Ubuntu
+20.04 installations should use their static ground or `uneven_ground` model and
+remove the dynamic terrain world plugin. This source no longer builds Classic
+plugin libraries.
+
 ## 1. Install dependencies
 
 Install the chosen simulator using its official instructions:
-[Harmonic](https://gazebosim.org/docs/harmonic/install_ubuntu/),
-[Jetty](https://gazebosim.org/docs/jetty/install_ubuntu/), or
-[Classic 11](https://classic.gazebosim.org/tutorials?tut=install_ubuntu).
-Use a separate Ubuntu 20.04 environment for Classic.
+[Harmonic](https://gazebosim.org/docs/harmonic/install_ubuntu/) or
+[Jetty](https://gazebosim.org/docs/jetty/install_ubuntu/).
 
 Install the common build dependencies:
 
@@ -50,9 +52,6 @@ sudo apt install libgz-sim8-dev libgz-plugin2-dev libgz-rendering8-ogre2-dev
 
 # Jetty / Ubuntu 24.04
 sudo apt install libgz-sim10-dev libgz-plugin4-dev libgz-rendering10-ogre2-dev
-
-# Classic 11 / Ubuntu 20.04
-sudo apt install gazebo11 libgazebo11-dev
 ```
 
 The default build does not discover Qt or gz-gui. Gazebo's distribution packages
@@ -74,11 +73,10 @@ Run **one** command for your simulator:
 ```bash
 JOBS=2 ./build.sh harmonic
 JOBS=2 ./build.sh jetty
-JOBS=2 ./build.sh classic
 ```
 
 The helper builds only the plugin libraries by default, in Release mode, with
-tests and the optional modern GUI preview disabled. Increase `JOBS` if you have
+tests and the optional GUI preview disabled. Increase `JOBS` if you have
 enough RAM for more parallel compilation.
 
 Equivalent CMake commands, using Jetty as an example:
@@ -89,7 +87,7 @@ cmake -S . -B build-jetty -DGZ_DISTRO=jetty \
 cmake --build build-jetty --parallel 2
 ```
 
-Replace `jetty` in both places with `harmonic` or `classic` as appropriate.
+Replace `jetty` in both places with `harmonic` for a Harmonic build.
 
 ## 3. Load the plugin
 
@@ -99,30 +97,23 @@ you launch Gazebo or PX4:
 ```bash
 # Harmonic; replace build-harmonic with build-jetty for Jetty.
 export GZ_SIM_SYSTEM_PLUGIN_PATH="$PWD/build-harmonic${GZ_SIM_SYSTEM_PLUGIN_PATH:+:$GZ_SIM_SYSTEM_PLUGIN_PATH}"
-
-# Classic
-export GAZEBO_PLUGIN_PATH="$PWD/build-classic${GAZEBO_PLUGIN_PATH:+:$GAZEBO_PLUGIN_PATH}"
 ```
 
 Configure the simulator using the matching example and the
 [simulation setup guide](docs/setup.md):
 
-- [Harmonic](examples/harmonic/plugin_snippet.sdf) and
-  [Jetty](examples/jetty/plugin_snippet.sdf): world system
-  `custom::DynamicTerrainSystem` plus model configuration
-  `custom::DynamicTerrainConfig`. Modern terrain rendering needs the Ogre2
-  Sensors system and an active camera sensor.
-- [Classic 11](examples/classic/plugin_snippet.world): world plugin with
-  `<tracked_model>` naming the model to follow. Headless collision works
-  independently of a rendering client.
+The [Harmonic](examples/harmonic/plugin_snippet.sdf) and
+[Jetty](examples/jetty/plugin_snippet.sdf) examples use the world system
+`custom::DynamicTerrainSystem` plus model configuration
+`custom::DynamicTerrainConfig`. Terrain rendering needs the Ogre2 Sensors
+system and an active camera sensor.
 
-Keep the libraries from each build together. Modern builds produce the core
-and system libraries; Classic builds also produce its shared adapter and visual
-plugin. Internet access is needed for terrain tiles not already cached.
+Keep the core and system libraries from each build together. Internet access
+is needed for terrain tiles not already cached.
 
 ## Optional GUI and tests
 
-For the modern GUI preview, install `libgz-gui8-dev`, `qtbase5-dev` and
+For the GUI preview, install `libgz-gui8-dev`, `qtbase5-dev` and
 `qtdeclarative5-dev` for Harmonic, or `libgz-gui10-dev`, `qt6-base-dev` and
 `qt6-declarative-dev` for Jetty. Then build with `BUILD_GUI=ON`:
 

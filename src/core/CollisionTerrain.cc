@@ -57,47 +57,6 @@ CollisionTerrainBuilder::CollisionTerrainBuilder(std::shared_ptr<TileStore> stor
 {
 }
 
-std::shared_ptr<const MeshData> collisionPatchMesh(const CollisionPatch &patch,
-                                                std::string &error)
-{
-    const cv::Mat encoded = cv::imread(patch.heightmap.string(), cv::IMREAD_UNCHANGED);
-    if (encoded.empty() || encoded.type() != CV_16UC1 ||
-        encoded.rows < 2 || encoded.cols < 2)
-    {
-        error = "collision mesh requires a 16-bit heightmap: " + patch.heightmap.string();
-        return {};
-    }
-    auto mesh = std::make_shared<MeshData>();
-    mesh->name = "collision_" + tileText(patch.center);
-    mesh->submeshName = "ground";
-    const std::size_t width = static_cast<std::size_t>(encoded.cols);
-    const std::size_t height = static_cast<std::size_t>(encoded.rows);
-    mesh->positions.reserve(width * height);
-    mesh->indices.reserve((width - 1) * (height - 1) * 6);
-    for (int row = 0; row < encoded.rows; ++row)
-    {
-        const auto *samples = encoded.ptr<std::uint16_t>(row);
-        const double y = (0.5 - static_cast<double>(row) / (encoded.rows - 1)) * patch.sizeY;
-        for (int col = 0; col < encoded.cols; ++col)
-        {
-            const double x = (static_cast<double>(col) / (encoded.cols - 1) - 0.5) * patch.sizeX;
-            const double z = static_cast<double>(samples[col]) / 65535.0 * patch.sizeZ;
-            mesh->positions.emplace_back(x, y, z);
-        }
-    }
-    for (std::size_t row = 0; row + 1 < height; ++row)
-        for (std::size_t col = 0; col + 1 < width; ++col)
-        {
-            const auto northwest = static_cast<std::uint32_t>(row * width + col);
-            const auto northeast = northwest + 1;
-            const auto southwest = static_cast<std::uint32_t>((row + 1) * width + col);
-            const auto southeast = southwest + 1;
-            mesh->indices.insert(mesh->indices.end(),
-                {northwest, southwest, northeast, northeast, southwest, southeast});
-        }
-    return mesh;
-}
-
 std::optional<CollisionPatch> CollisionTerrainBuilder::Build(
     const TileKey &center, std::string &error)
 {

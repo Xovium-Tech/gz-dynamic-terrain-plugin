@@ -1,12 +1,12 @@
 # Terrain configuration and providers
 
-These options apply to all three backends. Modern Gazebo reads them from the
-model configuration plugin; Classic reads them from the world plugin. See
+These options apply to Gazebo Harmonic and Jetty. Gazebo reads them from the
+model configuration plugin. See
 [simulation setup](setup.md) for the corresponding SDF placement.
 
 ## Configuration
 
-In modern Gazebo, these settings go inside the model's `custom::DynamicTerrainConfig` block. Classic uses the same settings inside its world plugin. Values below are defaults; the examples adjust a few of them for aircraft use.
+These settings go inside the model's `custom::DynamicTerrainConfig` block. Values below are defaults; the examples adjust a few of them for aircraft use.
 
 | Parameter | Default | Purpose |
 | --- | --- | --- |

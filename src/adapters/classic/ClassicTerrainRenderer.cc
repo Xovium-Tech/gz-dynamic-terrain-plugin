@@ -207,6 +207,10 @@ public:
             const auto visual = parent.lock();
             if (!visual || !visual->GetSceneNode()) throw std::runtime_error("terrain visual was removed");
             page.node = visual->GetSceneNode()->createChildSceneNode(Unique("page"));
+            // The origin-fixed anchor is a 1 mm box, so Classic gives its
+            // visual node a 0.001 scale. Terrain vertices and culling bounds
+            // already use world metres and must not inherit that scale.
+            page.node->setInheritScale(false);
             page.node->attachObject(page.geometry);
             page.geometry->setVisible(visible);
             page.offscreenFrames = 0;

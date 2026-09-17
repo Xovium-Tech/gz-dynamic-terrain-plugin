@@ -5,6 +5,23 @@ performed on September 16, 2026. They distinguish
 compilation from short component/runtime tests; they are not a claim of complete
 simulator compatibility or long-running flight validation.
 
+## Classic metre-scale regression — September 17, 2026
+
+The Classic renderer previously inherited the `0.001` scale of the world
+plugin's 1 mm visual anchor. Terrain vertices are already in world metres, so
+this reduced a 15 km span to 15 m and pulled terrain toward the world origin.
+Page nodes now disable inherited scale; geographic conversion and collision
+geometry are unchanged.
+
+`ClassicRenderer_TEST` now loads the production-sized anchor and places a
+20 m square at `(1000, -500, 25)`, with the camera 10 m above it. It checks
+terrain color over more than 90% of the camera image across five generations,
+texture refinements, native visual-plugin transport and resource cleanup.
+In the isolated Ubuntu 20.04 / Classic 11 environment below, the regression
+failed at the first terrain-pixel assertion before the fix and passed after
+it (26.19 s). This validates rendering scale and placement; it is not a full
+PX4 flight test or a run on the reporting user's Ubuntu 20.04 machine.
+
 ## Build environments
 
 - Core: Ubuntu 24.04, GCC 13.3, C++17, Curl and OpenCV 4.9; no Gazebo CMake discovery.

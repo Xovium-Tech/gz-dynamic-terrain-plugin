@@ -107,6 +107,7 @@ more mesh memory and insertion time in Classic than the modern heightmap path.
 
 - **Plugin not found:** check that `GZ_SIM_SYSTEM_PLUGIN_PATH` points to the build directory in the terminal that launches Gazebo or PX4. Keep both terrain libraries together.
 - **No terrain:** check the world coordinates, the model configuration block, the Ogre2 Sensors system, and that a camera is active. Look for tile download errors in the server output.
+- **Tiny or displaced Classic terrain:** rebuild the Classic plugin with the metre-scale fix. Older renderers inherited the `0.001` scale of the internal visual anchor, shrinking both the terrain and its distance from the world origin by 1,000. The updated renderer keeps page geometry in world metres; enlarging the world or `uneven_ground` is unnecessary.
 - **Terrain missing at altitude:** check the camera's far clipping distance as well as the visual radius. Increasing either can increase rendering work.
 - **Off-screen memory does not drop:** check camera names first. Cache reuse and allocator behaviour can keep process RSS above the amount of live terrain data, so inspect resource diagnostics as well as system memory.
 

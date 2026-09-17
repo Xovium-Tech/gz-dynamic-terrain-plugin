@@ -12,9 +12,11 @@ JOBS=2 ./build.sh harmonic
 The default build compiles plugin libraries only. Tests and the optional modern
 GUI preview are disabled; contributors can enable them explicitly.
 
-This release simplifies installation and release documentation. The shared
-terrain engine and separate simulator adapters are unchanged. See
-docs/validation.md for existing runtime test scope and limitations.
+This source update also fixes Classic terrain appearing as a tiny displaced
+patch: terrain pages now retain world-metre scale instead of inheriting the
+internal visual anchor's `0.001` scale. A camera regression covers the actual
+anchor size and terrain away from the world origin. See docs/validation.md
+for runtime test scope and limitations.
 
 No precompiled libraries are attached. Compile locally against your installed
 Gazebo version; libraries built for different Gazebo releases are not

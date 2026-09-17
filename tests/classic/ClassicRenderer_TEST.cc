@@ -41,7 +41,8 @@ std::shared_ptr<TerrainSnapshot> snapshot(std::uint64_t generation)
     out->resourcePrefix = "classic_renderer_test";
     auto mesh = std::make_shared<MeshData>();
     mesh->name = "classic_test_mesh_" + std::to_string(generation); mesh->submeshName = "surface";
-    mesh->positions = {{-10,-10,0},{10,-10,0},{-10,10,0},{10,10,0}};
+    // Terrain vertices are absolute world metres, including away from spawn.
+    mesh->positions = {{990,-510,25},{1010,-510,25},{990,-490,25},{1010,-490,25}};
     mesh->normals.assign(4, Vec3{0,0,1});
     mesh->texCoords = {{0,0},{1,0},{0,1},{1,1}};
     mesh->indices = {0,1,2,1,3,2};
@@ -98,11 +99,19 @@ int main()
         scene->SetAmbientColor(ignition::math::Color(1,1,1,1));
         scene->SetBackgroundColor(ignition::math::Color(0,0,0,1));
         gazebo::rendering::VisualPtr anchor(new gazebo::rendering::Visual("terrain_anchor",scene->WorldVisual()));
-        anchor->Load();
+        // Match the production world's tiny placeholder. Loading a default
+        // unit-scale Visual hid inherited-scale bugs in the terrain pages.
+        sdf::SDFPtr anchorSdf(new sdf::SDF); sdf::init(anchorSdf);
+        CHECK(sdf::readString("<sdf version='1.6'><model name='test'><link name='link'>"
+            "<visual name='anchor'><geometry><box><size>0.001 0.001 0.001</size>"
+            "</box></geometry><cast_shadows>false</cast_shadows>"
+            "</visual></link></model></sdf>", anchorSdf));
+        anchor->Load(anchorSdf->Root()->GetElement("model")->GetElement("link")->GetElement("visual"));
+        CHECK(anchor->Scale() == ignition::math::Vector3d(0.001,0.001,0.001));
         auto camera = scene->CreateCamera("terrain_camera",false);
         camera->Load(); camera->SetImageSize(64,64); camera->Init();
         camera->CreateRenderTexture("terrain_regression_camera"); camera->SetCaptureData(true);
-        camera->SetWorldPose(ignition::math::Pose3d(0,0,10,0,1.5707963267948966,0));
+        camera->SetWorldPose(ignition::math::Pose3d(1000,-500,35,0,1.5707963267948966,0));
         auto frame = [&] {
             gazebo::event::Events::preRender();
             camera->Render(true); camera->PostRender();
@@ -125,6 +134,12 @@ int main()
                 CHECK(pixels);
                 const auto center = (32*64+32)*3;
                 CHECK(pixels[center]>pixels[center+1]+40);
+                // A 20 m patch 10 m below the camera must cover the image,
+                // not just leave a few colored pixels near the world origin.
+                std::size_t terrainPixels = 0;
+                for (std::size_t pixel = 0; pixel < 64*64; ++pixel)
+                    if (pixels[pixel*3] > pixels[pixel*3+1]+40) ++terrainPixels;
+                CHECK(terrainPixels > 64*64*9/10);
                 TextureUpdate update; update.generation=generation;
                 const auto &page=terrain->pages[0];
                 update.pages.push_back({0,page.key,page.submeshName,15,64,solid(30,200,40),

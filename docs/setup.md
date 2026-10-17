@@ -56,7 +56,7 @@ Only list cameras that exist. The renderer waits until all listed cameras are av
 
 The example uses a 7.5 km terrain radius and concentrates detailed imagery around the terrain patch below the aircraft. Despite its name, `bottom_camera_only` selects a ground-distance region, not the exact footprint or direction of a camera.
 
-For video streaming, the separate [GstPlaneCameraSystem plugin](https://github.com/Xovium-Tech/px4-gazebo-gstreamer-camera-plugin) can be used with the same cameras. It is not required by the terrain plugin.
+For video streaming, the separate [GstPlaneCameraSystem plugin](https://github.com/Xovium-Tech/gz-gstreamer-enhanced-camera-plugin) can be used with the same cameras. It is not required by the terrain plugin.
 
 ## Start the simulation
 

@@ -65,3 +65,16 @@ jobs:
           test -f "build-$DISTRO/libgz-dynamic-terrain-core.so"
           test -f "build-$DISTRO/libgz-dynamic-terrain-system.so"
           if [ "$GUI" = ON ]; then test -f "build-$DISTRO/libDynamicTerrainGui.so"; fi
+      - name: Build minimal source archive
+        env:
+          DISTRO: ${{ matrix.distro }}
+          GUI: ${{ matrix.gui }}
+        run: |
+          mkdir source-archive
+          git archive --format=tar HEAD | tar -x -C source-archive
+          for excluded in .gitattributes .gitignore .github docs examples images tests tools; do
+            test ! -e "source-archive/$excluded"
+          done
+          cmake -S source-archive -B "build-archive-$DISTRO" -G Ninja -DGZ_DISTRO="$DISTRO" -DBUILD_GUI="$GUI" -DCMAKE_BUILD_TYPE=Release
+          grep -q '^BUILD_TESTING:BOOL=OFF$' "build-archive-$DISTRO/CMakeCache.txt"
+          cmake --build "build-archive-$DISTRO" --parallel 2

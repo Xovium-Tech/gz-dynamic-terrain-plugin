@@ -7,7 +7,7 @@ Stream map imagery and elevation terrain around a moving model in **Gazebo
 Harmonic or Jetty**. One shared terrain engine handles tile downloads,
 caching, mesh generation, collision terrain and progressive texture detail.
 
-[Watch the terrain demo](https://xovium.tech/videos/dynamic-terrain/).
+[![Watch the terrain demo](https://xovium.tech/media/dynamic-terrain-demo-140cfb8db1ca/preview.gif)](https://xovium.tech/videos/dynamic-terrain/)
 
 **Source-only distribution:** download the release ZIP and compile it on the
 computer running Gazebo. The archive contains source, headers, CMake files,

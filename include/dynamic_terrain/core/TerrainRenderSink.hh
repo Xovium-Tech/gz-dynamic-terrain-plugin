@@ -15,6 +15,8 @@ public:
     virtual void QueueSnapshot(std::shared_ptr<const TerrainSnapshot> snapshot) = 0;
     virtual void QueueTexture(TextureUpdate update) = 0;
     virtual std::uint64_t ActiveGeneration() const = 0;
+    virtual std::uint64_t ActiveCoverageRevision() const { return 0; }
+    virtual bool SupportsProgressiveInitial() const { return false; }
     virtual bool HasActiveTerrain() const = 0;
     virtual std::optional<TileKey> ActiveCenterTile() const = 0;
 };

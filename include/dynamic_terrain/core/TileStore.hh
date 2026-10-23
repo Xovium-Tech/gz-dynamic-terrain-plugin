@@ -1,6 +1,7 @@
 #pragma once
 
 #include "dynamic_terrain/core/TerrainTypes.hh"
+#include "dynamic_terrain/core/DownloadCache.hh"
 
 #include <opencv2/core.hpp>
 
@@ -17,13 +18,14 @@
 namespace dynamic_terrain
 {
 
-struct DownloadSpec
-{
-    std::string label;
-    std::string url;
-    fs::path path;
-};
+using DownloadSpec = DownloadRequest;
 
+struct TileStoreDiagnostics
+{
+    DownloadDiagnostics downloads;
+    std::size_t decodedDemBytes{0}, decodedDemEntries{0};
+    std::size_t decodedImageryBytes{0}, decodedImageryEntries{0};
+};
 
 struct ElevationMosaic
 {
@@ -36,13 +38,25 @@ struct ElevationMosaic
     double Sample(double latDeg, double lonDeg) const;
 };
 
-struct DownloadStats
+// Worker-local cancellation/priority, restored on scope exit. CPU builders also
+// inspect this context at row/page boundaries without changing sampled output.
+class ScopedDownloadContext
 {
-    std::size_t requested{0};
-    std::size_t cached{0};
-    std::size_t downloaded{0};
-    std::size_t failed{0};
-    double elapsedSec{0.0};
+public:
+    ScopedDownloadContext(DownloadCancelCheck cancel, int priority)
+        : previous_(std::move(check_)), previousPriority_(priority_)
+    { check_ = std::move(cancel); priority_ = priority; }
+    ~ScopedDownloadContext() { check_ = std::move(previous_); priority_ = previousPriority_; }
+    ScopedDownloadContext(const ScopedDownloadContext &) = delete;
+    ScopedDownloadContext &operator=(const ScopedDownloadContext &) = delete;
+    static bool Cancelled() { return check_ && check_(); }
+    static DownloadCancelCheck Check() { return check_; }
+    static int Priority() { return priority_; }
+private:
+    DownloadCancelCheck previous_;
+    int previousPriority_;
+    inline static thread_local DownloadCancelCheck check_;
+    inline static thread_local int priority_{0};
 };
 
 class BatchDownloader
@@ -51,9 +65,13 @@ public:
     explicit BatchDownloader(Config config);
     DownloadStats Ensure(const std::vector<DownloadSpec> &requests,
                          std::vector<fs::path> *failedPaths = nullptr) const;
+    void Stop() const { cache_.Stop(); }
+    DownloadDiagnostics Diagnostics() const { return cache_.Diagnostics(); }
+    void InvalidateValidation(const fs::path &path) const { cache_.InvalidateValidation(path); }
 
 private:
     Config cfg_;
+    DownloadCache cache_;
 };
 
 class TileStore
@@ -69,6 +87,8 @@ public:
 
     double OriginLatDeg() const { return originLatDeg_; }
     double OriginLonDeg() const { return originLonDeg_; }
+    void StopDownloads() const { downloader_.Stop(); }
+    TileStoreDiagnostics Diagnostics() const;
 
     fs::path ImageryPath(const TileKey &key) const;
     fs::path ElevationPath(const TileKey &key) const;
@@ -109,6 +129,7 @@ private:
     fs::path cacheRoot_;
     Provider imagery_;
     BatchDownloader downloader_;
+    bool terrarium_{true};
     std::string resourcePrefix_;
     double originLatDeg_{0.0};
     double originLonDeg_{0.0};
@@ -120,6 +141,13 @@ private:
     std::list<TileKey> demLru_;
     std::size_t demMemoryBytes_{0};
     std::array<std::mutex, 64> demFileMutexes_;
+
+    mutable std::mutex imageryMutex_;
+    mutable std::unordered_map<TileKey, cv::Mat, TileKeyHash> imageryMemory_;
+    mutable std::unordered_map<TileKey, std::list<TileKey>::iterator, TileKeyHash> imageryLruPos_;
+    mutable std::list<TileKey> imageryLru_;
+    mutable std::size_t imageryMemoryBytes_{0};
+    mutable std::array<std::mutex, 64> imageryFileMutexes_;
 
     std::mutex originMutex_;
     std::unordered_map<int, double> originOffsets_;

@@ -6,9 +6,45 @@
 #include <sstream>
 #include <stdexcept>
 #include <cmath>
+#include <unordered_map>
 
 namespace dynamic_terrain
 {
+void queueGuiSnapshot(TerrainRenderSink &renderer, const TerrainSnapshot *previous,
+                      const std::shared_ptr<const TerrainSnapshot> &incoming)
+{
+    if (!incoming) return;
+    const bool sameGeneration = previous && previous->generation == incoming->generation;
+    if (!sameGeneration || previous->coverageRevision != incoming->coverageRevision ||
+        previous->pages.size() != incoming->pages.size() ||
+        previous->progressiveInitial != incoming->progressiveInitial ||
+        previous->progressiveComplete != incoming->progressiveComplete)
+        renderer.QueueSnapshot(incoming);
+    if (!sameGeneration) return;
+
+    std::unordered_map<TileKey, const TerrainPage *, TileKeyHash> previousPages;
+    previousPages.reserve(previous->pages.size());
+    for (const auto &page : previous->pages) previousPages.emplace(page.key, &page);
+    TextureUpdate update;
+    update.generation = incoming->generation;
+    for (std::size_t i = 0; i < incoming->pages.size(); ++i)
+    {
+        const auto &page = incoming->pages[i];
+        const auto old = previousPages.find(page.key);
+        if (old == previousPages.end() || old->second->textureName == page.textureName ||
+            old->second->imageryZoom > page.imageryZoom)
+            continue;
+        TexturePageUpdate item;
+        item.pageIndex = i; item.pageKey = page.key;
+        item.submeshName = page.submeshName;
+        item.texture = page.texture; item.textureName = page.textureName;
+        item.imageryZoom = page.imageryZoom; item.textureSize = page.textureSize;
+        update.pages.push_back(std::move(item));
+    }
+    update.changedPageCount = update.pages.size();
+    if (!update.pages.empty()) renderer.QueueTexture(std::move(update));
+}
+
 preview::PageInfo guiPageInfo(const TerrainPage &page)
 {
     preview::PageInfo info;
@@ -19,6 +55,7 @@ preview::PageInfo guiPageInfo(const TerrainPage &page)
     info.set_submesh_name(page.submeshName);
     info.set_texture_size(std::min(page.textureSize, kGuiTextureSize));
     info.set_imagery_zoom(page.imageryZoom);
+    info.set_visual_only(page.visualOnly);
     return info;
 }
 
@@ -75,6 +112,7 @@ TerrainPage decodeGuiPage(const preview::Page &packet)
     page.key = {info.x(), info.y(), info.z()}; page.index = info.index();
     page.submeshName = info.submesh_name(); page.textureName = info.texture_name();
     page.textureSize = info.texture_size(); page.imageryZoom = info.imagery_zoom();
+    page.visualOnly = info.visual_only();
     auto mesh = std::make_shared<MeshData>();
     mesh->name = info.mesh_name();
     mesh->submeshName = page.submeshName;
@@ -131,6 +169,10 @@ GuiTerrainSource::GuiTerrainSource(const std::string &service)
                 if (state->snapshot)
                 {
                     manifest.set_prefix(state->snapshot->resourcePrefix);
+                    manifest.set_generation(state->snapshot->generation);
+                    manifest.set_coverage_revision(state->snapshot->coverageRevision);
+                    manifest.set_progressive_initial(state->snapshot->progressiveInitial);
+                    manifest.set_progressive_complete(state->snapshot->progressiveComplete);
                     for (const auto &page : state->snapshot->pages)
                         *manifest.add_pages() = guiPageInfo(page);
                 }
@@ -161,6 +203,22 @@ void GuiTerrainSource::SetSnapshot(const std::shared_ptr<const TerrainSnapshot> 
     if (!snapshot) return;
     auto copy = std::make_shared<TerrainSnapshot>(*snapshot);
     std::lock_guard<std::mutex> lock(state_->mutex);
+    if (state_->snapshot && state_->snapshot->resourcePrefix == copy->resourcePrefix)
+    {
+        if (copy->generation < state_->snapshot->generation ||
+            (copy->generation == state_->snapshot->generation &&
+             copy->coverageRevision < state_->snapshot->coverageRevision)) return;
+        for (auto &page : copy->pages)
+        {
+            const auto previous = std::find_if(state_->snapshot->pages.begin(), state_->snapshot->pages.end(),
+                [&](const auto &candidate) { return candidate.key == page.key; });
+            if (previous == state_->snapshot->pages.end() || previous->imageryZoom <= page.imageryZoom) continue;
+            page.texture = previous->texture;
+            page.textureName = previous->textureName;
+            page.textureSize = previous->textureSize;
+            page.imageryZoom = previous->imageryZoom;
+        }
+    }
     state_->snapshot = std::move(copy);
     ++state_->revision;
 }

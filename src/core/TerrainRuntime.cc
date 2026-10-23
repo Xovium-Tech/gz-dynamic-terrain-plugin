@@ -1,6 +1,7 @@
 #include "dynamic_terrain/core/TerrainRuntime.hh"
 #include "dynamic_terrain/core/TerrainBuilder.hh"
 #include <curl/curl.h>
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -20,6 +21,7 @@ struct RefinementRequest
 {
     std::shared_ptr<TerrainSnapshot> snapshot;
     std::uint64_t generation{0};
+    unsigned retryAttempt{0};
 };
 
 std::int64_t steadyMilliseconds()
@@ -76,8 +78,6 @@ std::optional<CollisionResult> collisionResult_;
         : cfg_(std::move(config)), spherical_(std::move(geographic)), renderer_(&renderer),
           onSnapshot_(std::move(snapshot)), onTexture_(std::move(texture))
     {
-        static std::once_flag curlInitFlag;
-        std::call_once(curlInitFlag, [] { curl_global_init(CURL_GLOBAL_DEFAULT); });
         store_ = std::make_shared<TileStore>(cfg_, spherical_);
         visualBuilder_ = std::make_unique<PersistentTerrainBuilder>(store_);
         collisionBuilder_ = std::make_unique<CollisionTerrainBuilder>(store_);
@@ -91,8 +91,14 @@ std::optional<CollisionResult> collisionResult_;
     }
     void Stop()
     {
-        stop_.store(true, std::memory_order_relaxed);
+        {
+            // Synchronise the predicate transition with each waiter's mutex;
+            // an atomic alone does not prevent a notify-before-wait race.
+            std::scoped_lock lock(visualMutex_, refineMutex_, collisionMutex_);
+            stop_.store(true, std::memory_order_relaxed);
+        }
         visualCv_.notify_all(); refineCv_.notify_all(); collisionCv_.notify_all();
+        if (store_) store_->StopDownloads();
         if (visualThread_.joinable()) visualThread_.join();
         if (refineThread_.joinable()) refineThread_.join();
         if (collisionThread_.joinable()) collisionThread_.join();
@@ -177,13 +183,30 @@ void visualWorker()
 
         auto isStale = [&]()
         {
-            return request.generation <
+            return stop_.load(std::memory_order_relaxed) || request.generation <
                    latestVisualGeneration_.load(std::memory_order_relaxed);
         };
 
+        ScopedDownloadContext downloads(isStale, 10);
+        // Only an empty Gazebo view opts into incremental activation. A failed
+        // replacement must continue to retain the complete old generation.
+        const bool hadActiveTerrain = renderer_->HasActiveTerrain();
+        PersistentTerrainBuilder::ProgressCallback progress;
+        if (!hadActiveTerrain && renderer_->SupportsProgressiveInitial())
+            progress = [&](const TerrainSnapshot &partial) {
+                if (isStale()) return false;
+                auto published = std::make_shared<const TerrainSnapshot>(partial);
+                renderer_->QueueSnapshot(published);
+                if (onSnapshot_) onSnapshot_(published);
+                if (cfg_.diagnostics)
+                    logInfo("[DynamicTerrain][VISUAL] initial progress generation=", request.generation,
+                            " revision=", partial.coverageRevision, " pages=", partial.pages.size(),
+                            " complete=", partial.progressiveComplete);
+                return true;
+            };
         std::string error;
         auto snapshot = visualBuilder_->BuildBootstrap(
-            request.center, request.generation, error);
+            request.center, request.generation, error, progress);
         if (!snapshot)
         {
             logError("[DynamicTerrain][VISUAL] generation=", request.generation,
@@ -204,7 +227,6 @@ void visualWorker()
             continue;
         }
 
-        const bool hadActiveTerrain = renderer_->HasActiveTerrain();
         if (hadActiveTerrain && cfg_.visualRefineTexture)
         {
             const int geometryZoom = snapshot->geometryRect.zoom;
@@ -333,46 +355,127 @@ void visualWorker()
             }
         }
 
-        renderer_->QueueSnapshot(std::make_shared<const TerrainSnapshot>(*snapshot));
-        if (onSnapshot_)
-            onSnapshot_(std::make_shared<const TerrainSnapshot>(*snapshot));
-        logInfo("[DynamicTerrain][VISUAL] coverage queued generation=",
-                request.generation,
-                " center=", tileText(request.center),
-                " priority=HIGH; refinement delegated");
-
-        const auto activationDeadline =
-            std::chrono::steady_clock::now() + std::chrono::seconds(5);
-        while (!isStale() &&
-               renderer_->ActiveGeneration() < request.generation &&
-               std::chrono::steady_clock::now() < activationDeadline &&
-               !stop_.load(std::memory_order_relaxed))
-        {
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        }
-
-        if (!isStale() && renderer_->ActiveGeneration() == request.generation)
-        {
-            queueRefinement(snapshot);
+        auto scheduleRetry = [&] {
+            visualRetryAfterMs_.store(steadyMilliseconds() + static_cast<std::int64_t>(
+                std::max(1.0, cfg_.retryDelaySec) * 1000.0), std::memory_order_relaxed);
+        };
+        auto extendCoverage = [&] {
+            // During progressive startup, missing ground must not wait behind
+            // hundreds of higher-resolution images for already visible pages.
+            // Collision (20) and initial near ground (10) still take precedence.
+            ScopedDownloadContext outerDownloads(isStale, progress ? 8 : 2);
+            std::string outerError;
+            auto extended = visualBuilder_->BuildOuterCoverage(*snapshot, outerError, progress);
+            if (!extended)
+            {
+                logInfo("[DynamicTerrain][COVERAGE] generation=", request.generation,
+                        " incomplete: ", outerError, "; active terrain retained");
+                if (!isStale()) scheduleRetry();
+                return false;
+            }
+            snapshot = std::move(extended);
+            return true;
+        };
+        auto publish = [&] {
+            if (isStale()) return false;
+            auto published = std::make_shared<const TerrainSnapshot>(*snapshot);
+            renderer_->QueueSnapshot(published);
+            if (onSnapshot_) onSnapshot_(published);
+            logInfo("[DynamicTerrain][VISUAL] coverage queued generation=", request.generation,
+                    " revision=", snapshot->coverageRevision,
+                    " center=", tileText(request.center));
+            const auto deadline = std::chrono::steady_clock::now() +
+                std::chrono::duration<double>(cfg_.visualActivationTimeoutSec);
+            auto active = [&] {
+                return renderer_->ActiveGeneration() == request.generation &&
+                    renderer_->ActiveCoverageRevision() >= snapshot->coverageRevision;
+            };
+            while (!isStale() && !active() && std::chrono::steady_clock::now() < deadline)
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            if (isStale()) return false;
+            if (!active())
+            {
+                logInfo("[DynamicTerrain][VISUAL] activation timeout generation=",
+                        request.generation, " revision=", snapshot->coverageRevision,
+                        "; keeping active terrain and retrying");
+                scheduleRetry();
+                return false;
+            }
+            visualBuilder_->PinActiveTextures(*snapshot);
+            // Separate page metadata from the visual worker's outer build;
+            // their large immutable image and mesh buffers remain shared.
+            queueRefinement(std::make_shared<TerrainSnapshot>(*snapshot));
             logInfo("[DynamicTerrain][VISUAL] active generation=", request.generation,
-                    " center=", tileText(request.center),
-                    " refinement_worker=queued");
-        }
-        else if (isStale())
+                    " revision=", snapshot->coverageRevision,
+                    " center=", tileText(request.center), " refinement_worker=queued");
+            return true;
+        };
+        // Bootstrap local ground immediately on startup. Every replacement
+        // thereafter includes the distant layer before replacing usable coverage.
+        if (hadActiveTerrain && cfg_.visualOuterRadiusM > 0 && !extendCoverage())
         {
-            logInfo("[DynamicTerrain][VISUAL] generation=", request.generation,
-                    " superseded before activation");
+            visualBuilding_.store(false, std::memory_order_relaxed);
+            continue;
         }
-        else
+        if (hadActiveTerrain && cfg_.visualRefineTexture)
         {
-            logInfo("[DynamicTerrain][VISUAL] generation=", request.generation,
-                    " activation timeout; active=", renderer_->ActiveGeneration(),
-                    "; scheduling retry so this center cannot become permanently blocked");
-            visualRetryAfterMs_.store(
-                steadyMilliseconds() + static_cast<std::int64_t>(
-                                           std::max(5.0, cfg_.retryDelaySec) * 1000.0),
-                std::memory_order_relaxed);
+            // Recentering changes the outer quadtree's page keys. A resident
+            // texture keyed by the old parent/children cannot protect the new
+            // pages from a bootstrap-quality flash. Prepare their final LOD
+            // before activation, keeping the complete old view during downloads.
+            // Initial startup still publishes each available bootstrap page.
+            ScopedDownloadContext outerDownloads(isStale, 2);
+            const auto order = visualBuilder_->ProgressivePageOrder(*snapshot);
+            for (int zoom = 0; zoom <= 20 && !isStale(); ++zoom)
+            {
+                std::vector<std::size_t> batch;
+                std::size_t sourceTiles = 0;
+                const auto limit = static_cast<std::size_t>(
+                    std::max(1, cfg_.visualRefineMaxSourceTilesPerBatch));
+                auto prepareBatch = [&] {
+                    if (batch.empty() || isStale()) return;
+                    std::string stageError;
+                    auto update = visualBuilder_->BuildTextureStage(*snapshot, batch, zoom, stageError);
+                    if (update) visualBuilder_->ApplyTextureUpdate(*snapshot, *update);
+                    if (!stageError.empty())
+                        logInfo("[DynamicTerrain][TEXTURE] recenter outer generation=",
+                                request.generation, " z=", zoom, " partial: ", stageError);
+                    batch.clear();
+                    sourceTiles = 0;
+                };
+                for (const auto i : order)
+                {
+                    if (isStale()) break;
+                    const auto &page = snapshot->pages[i];
+                    if (!page.visualOnly || page.imageryZoom >= zoom ||
+                        visualBuilder_->TargetZoomForPage(*snapshot, i) != zoom)
+                        continue;
+                    const std::size_t cost = std::size_t{1} << (2 * std::max(0, zoom - page.key.z));
+                    if (!batch.empty() && sourceTiles + cost > limit) prepareBatch();
+                    batch.push_back(i);
+                    sourceTiles += cost;
+                }
+                prepareBatch();
+            }
+            const bool ready = std::all_of(snapshot->pages.begin(), snapshot->pages.end(),
+                [](const TerrainPage &page) {
+                    return !page.visualOnly || page.imageryZoom >= page.targetImageryZoom;
+                });
+            if (isStale() || !ready)
+            {
+                if (!isStale())
+                {
+                    logInfo("[DynamicTerrain][VISUAL] generation=", request.generation,
+                            " outer imagery incomplete; keeping current active terrain and retrying");
+                    scheduleRetry();
+                }
+                visualBuilding_.store(false, std::memory_order_relaxed);
+                continue;
+            }
         }
+        if (publish() && !hadActiveTerrain && cfg_.visualOuterRadiusM > 0 &&
+            !isStale() && extendCoverage())
+            publish();
 
         visualBuilding_.store(false, std::memory_order_relaxed);
     }
@@ -396,9 +499,11 @@ void refinementWorker()
 
         auto stale = [&]()
         {
-            return request.generation !=
+            return stop_.load(std::memory_order_relaxed) || request.generation !=
                        latestVisualGeneration_.load(std::memory_order_relaxed) ||
-                   renderer_->ActiveGeneration() != request.generation;
+                   renderer_->ActiveGeneration() != request.generation ||
+                   (request.snapshot && !request.snapshot->progressiveInitial &&
+                    renderer_->ActiveCoverageRevision() != request.snapshot->coverageRevision);
         };
         const auto activationDeadline =
             std::chrono::steady_clock::now() + std::chrono::seconds(2);
@@ -416,6 +521,13 @@ void refinementWorker()
             continue;
         }
 
+        // Keep near-detail priority over background replacements. Progressive
+        // startup gives missing coverage priority 8 in visualWorker; after full
+        // coverage is resident, further refinements use background priority 0.
+        ScopedDownloadContext downloads(stale,
+            cfg_.visualOuterRadiusM > 0 &&
+            std::none_of(request.snapshot->pages.begin(), request.snapshot->pages.end(),
+                [](const TerrainPage &page) { return page.visualOnly; }) ? 5 : 0);
         auto &snapshot = *request.snapshot;
         const int geometryZoom = snapshot.geometryRect.zoom;
         auto pageOrder = visualBuilder_->ProgressivePageOrder(snapshot);
@@ -425,27 +537,16 @@ void refinementWorker()
         for (std::size_t i = 0; i < snapshot.pages.size(); ++i)
             pageZoom[i] = snapshot.pages[i].imageryZoom;
 
+        int minimumZoom = geometryZoom;
+        for (const auto &page : snapshot.pages) minimumZoom = std::min(minimumZoom, page.key.z);
         int maxTargetZoom = geometryZoom;
         for (std::size_t i = 0; i < snapshot.pages.size(); ++i)
             maxTargetZoom = std::max(
                 maxTargetZoom, visualBuilder_->TargetZoomForPage(snapshot, i));
 
         std::vector<int> refinementLevels;
-        refinementLevels.push_back(geometryZoom);
-        if (cfg_.visualDetailMode == "bottom_camera_only")
-        {
-            if (cfg_.visualDetailZoom > geometryZoom)
-                refinementLevels.push_back(std::min(maxTargetZoom, cfg_.visualDetailZoom));
-        }
-        else
-        {
-            for (int z = geometryZoom + 1; z <= maxTargetZoom; ++z)
-                refinementLevels.push_back(z);
-        }
-        std::sort(refinementLevels.begin(), refinementLevels.end());
-        refinementLevels.erase(
-            std::unique(refinementLevels.begin(), refinementLevels.end()),
-            refinementLevels.end());
+        for (int zoom = minimumZoom; zoom <= maxTargetZoom; ++zoom)
+            refinementLevels.push_back(zoom);
 
         for (const int zoom : refinementLevels)
         {
@@ -463,7 +564,9 @@ void refinementWorker()
             if (candidates.empty())
                 continue;
 
-            const int delta = std::max(0, zoom - geometryZoom);
+            int delta = 0;
+            for (const auto index : candidates)
+                delta = std::max(delta, zoom - snapshot.pages[index].key.z);
             std::size_t tilesPerPage = 1u;
             for (int i = 0; i < delta; ++i)
                 tilesPerPage *= 4u;
@@ -491,16 +594,25 @@ void refinementWorker()
                 if (update)
                 {
                     visualBuilder_->ApplyTextureUpdate(snapshot, *update);
+                    visualBuilder_->PinActiveTextures(snapshot);
                     changedPages += update->pages.size();
                     for (auto &u : update->pages)
                     {
                         if (u.pageIndex < pageZoom.size())
                             pageZoom[u.pageIndex] = std::max(
                                 pageZoom[u.pageIndex], u.imageryZoom);
+                        if (cfg_.visualProgressiveUploads)
+                            continue;
                         auto existing = finalPageUpdates.find(u.pageIndex);
                         if (existing == finalPageUpdates.end() ||
                             u.imageryZoom >= existing->second.imageryZoom)
                             finalPageUpdates[u.pageIndex] = std::move(u);
+                    }
+                    if (cfg_.visualProgressiveUploads)
+                    {
+                        if (onTexture_)
+                            onTexture_(*update);
+                        renderer_->QueueTexture(std::move(*update));
                     }
                 }
                 if (!stageError.empty())
@@ -538,9 +650,26 @@ void refinementWorker()
             }
             logInfo("[DynamicTerrain][TEXTURE] refinement complete generation=",
                     request.generation, " changed_pages=", changedPages,
-                    " gpu_page_uploads=", finalPageUpdates.size());
+                    " gpu_page_uploads=", cfg_.visualProgressiveUploads ? changedPages : finalPageUpdates.size());
         }
         refinementActive_.store(false, std::memory_order_relaxed);
+        // A stationary aircraft must recover after an outage too. Previously a
+        // failed refinement was abandoned forever until the next recenter.
+        bool incomplete = false;
+        for (std::size_t i = 0; i < pageZoom.size(); ++i)
+            incomplete |= pageZoom[i] < visualBuilder_->TargetZoomForPage(snapshot, i);
+        if (incomplete && !stale())
+        {
+            const double delay = std::min(30.0, cfg_.retryDelaySec *
+                static_cast<double>(1u << std::min(request.retryAttempt, 5u)));
+            std::unique_lock<std::mutex> lock(refineMutex_);
+            refineCv_.wait_for(lock, std::chrono::duration<double>(delay), [&] {
+                return stop_.load(std::memory_order_relaxed) || refineRequest_.has_value();
+            });
+            if (!refineRequest_ && !stale())
+                refineRequest_ = RefinementRequest{request.snapshot, request.generation,
+                                                   request.retryAttempt + 1u};
+        }
     }
 }
 
@@ -597,6 +726,10 @@ void collisionWorker()
             request = *collisionRequest_;
             collisionRequest_.reset();
         }
+        ScopedDownloadContext downloads([&] {
+            return stop_.load(std::memory_order_relaxed) || request.generation <
+                latestCollisionGeneration_.load(std::memory_order_relaxed);
+        }, 20);
         CollisionResult result;
         result.request = request;
         result.patch = collisionBuilder_->Build(request.center, result.error);
@@ -640,4 +773,13 @@ std::optional<CollisionResult> TerrainRuntime::PollCollision(bool hasActiveColli
 bool TerrainRuntime::VisualBuilding() const { return impl_->visualBuilding_.load(); }
 bool TerrainRuntime::RefinementActive() const { return impl_->refinementActive_.load(); }
 std::uint64_t TerrainRuntime::LatestVisualGeneration() const { return impl_->latestVisualGeneration_.load(); }
+TerrainRuntimeDiagnostics TerrainRuntime::Diagnostics() const
+{
+    const auto store = impl_->store_->Diagnostics();
+    const auto pages = impl_->visualBuilder_->CachedPageStats();
+    const auto meshes = impl_->visualBuilder_->CachedOuterMeshStats();
+    return {store.downloads, store.decodedDemBytes, store.decodedDemEntries,
+        store.decodedImageryBytes, store.decodedImageryEntries, pages.bytes, pages.pages,
+        meshes.bytes, meshes.pages, meshes.limitBytes, meshes.hits, meshes.misses};
+}
 }

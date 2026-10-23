@@ -60,6 +60,9 @@ std::vector<std::pair<double, int>> parseZoomTable(const std::string &text)
 Config parseTerrainConfig(const std::shared_ptr<const sdf::Element> &sdf)
 {
     Config cfg;
+    // Gazebo publishes each ready refinement batch. Keep the shared runtime
+    // default unchanged for other simulator adapters and honor explicit SDF.
+    cfg.visualProgressiveUploads = true;
     readSdf(sdf, "model_name", cfg.modelName);
     readSdf(sdf, "tracked_model", cfg.modelName);
     readSdf(sdf, "imagery_provider", cfg.imageryProvider);
@@ -72,6 +75,10 @@ Config parseTerrainConfig(const std::shared_ptr<const sdf::Element> &sdf)
     readSdf(sdf, "elevation_max_zoom", cfg.elevationMaxZoom);
 
     readSdf(sdf, "visual_radius_m", cfg.visualRadiusM);
+    readSdf(sdf, "visual_outer_radius_m", cfg.visualOuterRadiusM);
+    int outerMeshCacheMb = static_cast<int>(cfg.visualOuterMeshCacheMb);
+    readSdf(sdf, "visual_outer_mesh_cache_mb", outerMeshCacheMb);
+    cfg.visualOuterMeshCacheMb = static_cast<std::size_t>(std::max(0, outerMeshCacheMb));
     readSdf(sdf, "visual_gui", cfg.visualGui);
     readSdf(sdf, "visual_geometry_zoom", cfg.visualGeometryZoom);
     readSdf(sdf, "visual_elevation_zoom", cfg.visualElevationZoom);
@@ -92,9 +99,13 @@ Config parseTerrainConfig(const std::shared_ptr<const sdf::Element> &sdf)
     readSdf(sdf, "visual_bootstrap_imagery_zoom", cfg.visualBootstrapImageryZoom);
     readSdf(sdf, "visual_recenter_distance_m", cfg.visualRecenterDistanceM);
     readSdf(sdf, "visual_warmup_frames", cfg.visualWarmupFrames);
+    readSdf(sdf, "visual_upload_pages_per_frame", cfg.visualUploadPagesPerFrame);
+    readSdf(sdf, "visual_upload_budget_ms", cfg.visualUploadBudgetMs);
+    readSdf(sdf, "visual_activation_timeout_sec", cfg.visualActivationTimeoutSec);
     readSdf(sdf, "visual_frustum_eviction", cfg.visualFrustumEviction);
     readSdf(sdf, "visual_offscreen_frames", cfg.visualOffscreenFrames);
     readSdf(sdf, "visual_refine_texture", cfg.visualRefineTexture);
+    readSdf(sdf, "visual_progressive_uploads", cfg.visualProgressiveUploads);
     readSdf(sdf, "visual_recenter_ready_zoom", cfg.visualRecenterReadyZoom);
     readSdf(sdf, "visual_refine_max_source_tiles_per_batch",
             cfg.visualRefineMaxSourceTilesPerBatch);
@@ -119,6 +130,9 @@ Config parseTerrainConfig(const std::shared_ptr<const sdf::Element> &sdf)
     int decodedDemCacheMb = static_cast<int>(cfg.decodedDemCacheMb);
     readSdf(sdf, "decoded_dem_cache_mb", decodedDemCacheMb);
     cfg.decodedDemCacheMb = static_cast<std::size_t>(std::max(1, decodedDemCacheMb));
+    int decodedImageryCacheMb = static_cast<int>(cfg.decodedImageryCacheMb);
+    readSdf(sdf, "decoded_imagery_cache_mb", decodedImageryCacheMb);
+    cfg.decodedImageryCacheMb = static_cast<std::size_t>(std::max(0, decodedImageryCacheMb));
 
     readSdf(sdf, "dynamic_zoom", cfg.dynamicZoom);
     readSdf(sdf, "static_zoom", cfg.staticZoom);

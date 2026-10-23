@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(gz_dynamic_terrain_plugin VERSION 0.2.1 LANGUAGES CXX)
+project(gz_dynamic_terrain_plugin VERSION 0.3.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -33,7 +33,39 @@ endif()
 include(CTest)
 find_package(Threads REQUIRED)
 find_package(CURL REQUIRED)
+option(BUILD_DOWNLOAD_ONLY "Build only the simulator-independent HTTP/cache service" OFF)
+add_library(dynamic-terrain-download STATIC src/core/DownloadCache.cc)
+target_include_directories(dynamic-terrain-download PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+target_link_libraries(dynamic-terrain-download PUBLIC CURL::libcurl Threads::Threads)
+target_compile_options(dynamic-terrain-download PRIVATE -Wall -Wextra -Wpedantic)
+if(BUILD_TESTING)
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    add_executable(DownloadCache_TEST tests/DownloadCache_TEST.cc)
+    target_link_libraries(DownloadCache_TEST PRIVATE dynamic-terrain-download)
+    add_test(NAME DownloadCache_TEST COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/http_fixture.py $<TARGET_FILE:DownloadCache_TEST>)
+    set_tests_properties(DownloadCache_TEST PROPERTIES TIMEOUT 60)
+    add_test(NAME DownloadCache_TLS_TEST COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/tls_fixture.py $<TARGET_FILE:DownloadCache_TEST>)
+    set_tests_properties(DownloadCache_TLS_TEST PROPERTIES TIMEOUT 60)
+    add_executable(DownloadLocal_TEST tests/DownloadLocal_TEST.cc)
+    target_link_libraries(DownloadLocal_TEST PRIVATE dynamic-terrain-download)
+    foreach(mode memory cancel stop)
+        add_test(NAME DownloadLocal_${mode}_TEST COMMAND DownloadLocal_TEST
+            ${CMAKE_CURRENT_BINARY_DIR}/download-local-${mode} ${mode})
+        set_tests_properties(DownloadLocal_${mode}_TEST PROPERTIES TIMEOUT 15)
+    endforeach()
+endif()
+if(BUILD_DOWNLOAD_ONLY)
+    install(TARGETS dynamic-terrain-download ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+    install(FILES include/dynamic_terrain/core/DownloadCache.hh
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/dynamic_terrain/core)
+    return()
+endif()
 find_package(OpenCV REQUIRED COMPONENTS core imgcodecs imgproc)
+find_package(JPEG REQUIRED)
 
 add_library(gz-dynamic-terrain-core SHARED
     src/core/TerrainTypes.cc
@@ -50,7 +82,7 @@ target_include_directories(gz-dynamic-terrain-core PUBLIC
 )
 target_link_libraries(gz-dynamic-terrain-core
     PUBLIC Threads::Threads ${OpenCV_LIBS}
-    PRIVATE CURL::libcurl
+    PRIVATE dynamic-terrain-download JPEG::JPEG
 )
 target_compile_options(gz-dynamic-terrain-core PRIVATE -Wall -Wextra -Wpedantic)
 set_target_properties(gz-dynamic-terrain-core PROPERTIES INSTALL_RPATH_USE_LINK_PATH TRUE)
@@ -124,6 +156,10 @@ endif()
 
 if(BUILD_TESTING)
     file(GLOB terrain_core_tests CONFIGURE_DEPENDS tests/core/*_TEST.cc)
+    add_executable(TerrainParityBenchmark tools/terrain_parity_benchmark.cc)
+    target_link_libraries(TerrainParityBenchmark PRIVATE gz-dynamic-terrain-core)
+    add_executable(TerrainStreamingSoak tools/terrain_streaming_soak.cc)
+    target_link_libraries(TerrainStreamingSoak PRIVATE gz-dynamic-terrain-core)
     foreach(test_source IN LISTS terrain_core_tests)
         get_filename_component(test_name "${test_source}" NAME_WE)
         add_executable(${test_name} "${test_source}")

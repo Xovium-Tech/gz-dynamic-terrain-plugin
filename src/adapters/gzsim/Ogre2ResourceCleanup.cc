@@ -1,7 +1,10 @@
 #include "Ogre2ResourceCleanup.hh"
 
+#include <gz/common/Console.hh>
 #include <gz/rendering/RenderEngine.hh>
 #include <gz/rendering/ogre2/Ogre2RenderEngine.hh>
+#include <gz/rendering/ogre2/Ogre2MeshFactory.hh>
+#include <gz/rendering/ogre2/Ogre2Scene.hh>
 
 #include <OgreRenderSystem.h>
 #include <OgreRoot.h>
@@ -9,6 +12,7 @@
 #include <OgreMesh.h>
 #include <OgreSubMesh.h>
 #include <OgreMeshManager2.h>
+#include <OgreMesh2.h>
 #include <OgreTextureGpu.h>
 #include <OgreTextureGpuManager.h>
 
@@ -41,6 +45,38 @@ std::string generatedOgreMeshName(const std::string &commonMeshName)
 {
     return commonMeshName + "::::ORIGINAL";
 }
+
+class TerrainMeshImporter : public gz::rendering::Ogre2MeshFactory
+{
+public:
+    using Ogre2MeshFactory::Ogre2MeshFactory;
+    using Ogre2MeshFactory::Load;
+};
+}
+
+bool prepareOgre2TerrainMesh(const gz::rendering::ScenePtr &scene,
+                            const gz::common::Mesh *mesh)
+{
+    if (!ogre2Scene(scene) || !mesh) return true;
+    auto ogreScene = std::dynamic_pointer_cast<gz::rendering::Ogre2Scene>(scene);
+    gz::rendering::MeshDescriptor descriptor(mesh);
+    descriptor.Load();
+    const auto name = generatedOgreMeshName(descriptor.meshName);
+    auto &manager = Ogre::MeshManager::getSingleton();
+    if (manager.resourceExists(name)) return true;
+
+    // Ogre2MeshFactory::OgreItem appends imported names to ogreMeshes until
+    // scene teardown, even when a plugin subsequently removes the resources.
+    // Run the same protected loader in our own importer and pre-create v2 so
+    // the scene's factory takes its existing-resource path. Import flags match
+    // Gazebo Harmonic/Jetty exactly; vertex data and materials are unchanged.
+    TerrainMeshImporter importer(ogreScene);
+    if (!importer.Load(descriptor)) return false;
+    const auto legacy = Ogre::v1::MeshManager::getSingleton().getByName(name);
+    if (!legacy) return false;
+    auto converted = manager.createManual(name, Ogre::ResourceGroupManager::DEFAULT_RESOURCE_GROUP_NAME);
+    converted->importV1(legacy.get(), false, true, true);
+    return true;
 }
 
 bool destroyUnreferencedOgre2Texture(

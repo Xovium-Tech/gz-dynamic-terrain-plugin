@@ -11,6 +11,8 @@ These settings go inside the model's `custom::DynamicTerrainConfig` block. Value
 | Parameter | Default | Purpose |
 | --- | --- | --- |
 | `visual_radius_m` | `7500` | Radius of the visual terrain area, in metres. |
+| `visual_outer_radius_m` | `0` | Additional visual-only terrain out to this radius, up to `2000000` metres; `0` disables it. |
+| `visual_outer_mesh_cache_mb` | `128` | Byte limit for reusable immutable outer mesh buffers; `0` disables reuse, maximum `1024` MiB. |
 | `visual_geometry_zoom` | `14` | Tile zoom used to divide the terrain mesh into pages. |
 | `visual_elevation_zoom` | `13` | Elevation source zoom for the visual mesh. |
 | `visual_mesh_cells_per_tile` | `64` | Mesh subdivisions per tile edge. |
@@ -30,6 +32,65 @@ For lower VRAM use, start by reducing `visual_page_texture_max_size` to `1024` o
 The two RAM cache budgets are not a limit on total Gazebo memory. Active terrain, pending updates, cameras, physics, and the renderer need additional memory. The disk cache is separate and has no automatic size limit.
 
 Collision resolution changes with the model's local Z coordinate when `dynamic_zoom` is enabled; it is not based on height above the terrain. For fixed resolution, set `dynamic_zoom` to `false` and choose `static_zoom`.
+
+### Distant coverage and camera clipping
+
+`visual_radius_m` continues to define the protected near mesh. Optional
+`visual_outer_radius_m` adds a balanced quadtree outside that rectangle: distant
+pages use progressively larger geographic tiles, their own elevation zoom and
+small textures. The existing near vertices, indices, normals, UVs and imagery
+are retained. Outer pages have no collision; collision settings are unchanged.
+Texture compression alone cannot fill an area where no geometry exists.
+
+The partition contains at most 1024 pages and 4 million vertices. A halo at the
+near mesh's original resolution, including 128-cell configurations, protects
+its boundary. Added finer edges follow the neighboring coarser edge segments.
+Boundary triangles share the same subdivided edge endpoints on both sides,
+including after float conversion, so rasterization does not depend on a
+T-junction remaining exactly collinear. This also supports odd subdivision
+counts; the protected mesh is never moved or retriangulated. Distant pages use
+at most 64 cells per edge. DEM neighbors and imagery requests are deduplicated
+and batched; a fine-resolution DEM mosaic is never allocated for the whole
+distant region.
+
+The outer mesh cache reuses unchanged coarse pages across recenters. Its key
+includes geographic tile, subdivisions, elevation zoom, the coarser neighbors
+used to stitch each edge and the finer-neighbor boundary topology. The near-resolution halo is rebuilt so its copied
+boundary always matches the protected near mesh. Reuse retains the exact vertex,
+normal, UV and index buffers and stable renderer resources; it does not simplify
+an existing mesh. `CachedOuterMeshStats()` exposes retained bytes, byte limit,
+entries, hits and misses. The byte limit covers disposable cached buffers; active
+and staging meshes remain owned by their snapshots.
+
+On first Gazebo startup, completed geographic pages become visible independently
+within the existing upload and warmup budgets. Cumulative revisions append pages
+without hiding or uploading those already displayed, including when a newer
+revision arrives before the previous upload finishes. Failed additions retain
+the available pages. The near patch can activate while a worker prepares the outer
+coverage. Subsequent replacements keep the previous complete terrain until the
+entire new coverage is ready. A failed or cancelled outer build cannot remove
+the current terrain. The initial expansion uses a coverage revision within the
+same terrain generation, preserving collision and any near imagery that refined
+while it was prepared. Initial uncached coverage still requires valid data from
+the configured providers; no blank or synthetic outer images are committed on
+download failure.
+
+Startup coverage revisions increase with cumulative page publications; revision
+`1` no longer means the entire distant layer is ready. A
+`[DynamicTerrain][STARTUP] revision active ... complete=1` log entry acknowledges
+the final startup coverage after its last page has warmed up. Earlier
+`page visible` events show independent progress. Later recentering still uses
+complete snapshots and atomic replacement. This changes scheduling, not the
+geographic tile size or the final mesh and image content.
+
+For the Xovium high-altitude preset, `visual_outer_radius_m=2000000` is paired
+with a camera `<far>1000000</far>` to accommodate views from 30 km above ground.
+Changing terrain coverage cannot override a camera's far clipping plane. A very
+long far plane also requires a renderer with suitable depth precision: the
+tested Harmonic and Jetty Ogre2 backends report reversed depth enabled. The
+standalone plugin leaves both camera settings and outer coverage unchanged
+unless configured. Terrain still follows the provider's Web Mercator domain;
+the existing clipping at the Mercator latitude and longitude limits remains.
 
 ## Imagery and elevation providers
 
@@ -150,7 +211,21 @@ In XML, write `&amp;` between query parameters, for example:
 
 ### Cache and provider errors
 
-Restart the simulation after changing provider settings. Cache entries are keyed by provider name and tile coordinates, not by the complete URL or token. When changing an endpoint or elevation dataset under the same provider name, choose a new `cache_dir` to avoid reusing old tiles.
+Restart the simulation after changing provider settings. Built-in providers retain their established provider/zoom/X/Y cache paths. An explicit custom imagery or elevation URL adds a stable dataset namespace derived from the provider, URL template and encoding. Two custom endpoints therefore cannot silently reuse each other's tiles. Runtime `{token}` substitution does not change the namespace. Existing provider-only custom caches have no trustworthy endpoint identity and are not imported automatically; built-in caches remain reusable.
+
+The shared downloader keeps connections across batches, validates encoded tiles before atomic publication, repairs corrupt cache entries, and coordinates writers with per-tile file locks. Lock files intentionally remain beside tiles: unlinking them could let two writers lock different inodes. Temporary `.part.*` files are removed on handled failures. Local absolute paths and `file://` templates use the same validation and publication path. HTTPS continues to verify certificates and hostnames; `CURL_CA_BUNDLE` takes precedence over `SSL_CERT_FILE`, including invalid explicit overrides.
+
+`decoded_imagery_cache_mb` controls the bounded decoded-source image cache (default 64 MiB, zero disables it); `decoded_dem_cache_mb` retains its existing meaning. Neither setting changes image resolution or sampling. Download buffers default to a 32 MiB maximum encoded tile, with at most the configured number of active transfers; the standalone download service exposes this bound through `DownloadCacheOptions`. Cache validation metadata is bounded too. The disk cache remains persistent without automatic deletion.
+
+The refined-page LRU follows `visual_page_cache_mb` without an additional page
+count limit. The active snapshot also pins its already-owned images: overlapping
+pages retain their highest available detail even with the disposable LRU set to
+zero. Generation and coverage-revision checks prevent an older refinement from
+replacing newer active images. Incomplete refinements retry while stationary,
+with cancellable backoff capped at 30 seconds, so recovery does not require
+moving into another tile.
+
+`visual_upload_pages_per_frame` (default 8) and `visual_upload_budget_ms` (default 2 ms) limit initial page publication, new-generation staging and texture refinement work between pages. One indivisible page upload may exceed the time budget. Unprocessed refinements remain queued and coalesce by generation and page; unrelated updates are retained. Existing complete terrain stays visible until all replacement pages are ready and warmed up; allocation failures retain the current generation. `visual_activation_timeout_sec` (default 5) controls the runtime's acknowledgement timeout; integrations that defer physics cooking or upload many outer pages can increase it. Gazebo's SDF adapter defaults `visual_progressive_uploads` to true, publishing each ready imagery batch; an explicit false retains deferred texture publication. The shared configuration default and other simulator adapters remain unchanged. Geometry, image sizes, lighting, shadows and collision settings are unchanged by these scheduling controls. Frustum residency considers the union of selected cameras, and restores evicted pages conservatively if the camera set becomes incomplete or a projection cannot be classified.
 
 For failed downloads, enable `diagnostics` and check the provider response. Mapbox documents `401` for missing or invalid tokens, `403` for access issues (including some URL-restricted tokens), `404` for missing tiles or tilesets, and `429` for rate limiting. See its [API error reference](https://docs.mapbox.com/api/maps/raster-tiles/). If requests are throttled, reduce `download_concurrency` and `download_per_host`.
 

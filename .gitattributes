@@ -1,9 +1,31 @@
-# Keep GitHub source downloads and release archives focused on buildable source.
+* text=auto
+*.sh text eol=lf
+*.py text eol=lf
+*.uasset binary
 /.gitattributes export-ignore
 /.gitignore export-ignore
 /.github export-ignore
 /docs export-ignore
-/examples export-ignore
 /images export-ignore
+/videos export-ignore
+/examples export-ignore
 /tests export-ignore
 /tools export-ignore
+/build export-ignore
+/build-* export-ignore
+/Binaries export-ignore
+/Intermediate export-ignore
+/Saved export-ignore
+/DerivedDataCache export-ignore
+/.sdk export-ignore
+/artifacts export-ignore
+/package.py export-ignore
+/package.sh export-ignore
+**/__pycache__ export-ignore
+*.pyc export-ignore
+*.so export-ignore
+*.o export-ignore
+*.a export-ignore
+*.log export-ignore
+*.tar.gz export-ignore
+/BINARY_MANIFEST.json export-ignore

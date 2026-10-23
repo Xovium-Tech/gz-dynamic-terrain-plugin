@@ -126,11 +126,19 @@ void PersistentTerrainRenderer::QueueSnapshot(
         return;
     if (pendingTexture_ && pendingTexture_->generation < snapshot->generation)
         pendingTexture_.reset();
-    if (!pendingSnapshot_ || snapshot->generation >= pendingSnapshot_->generation)
+    if (!pendingSnapshot_ || snapshot->generation > pendingSnapshot_->generation ||
+        (snapshot->generation == pendingSnapshot_->generation &&
+         snapshot->coverageRevision >= pendingSnapshot_->coverageRevision))
         pendingSnapshot_ = std::move(snapshot);
 }
 
 void PersistentTerrainRenderer::QueueTexture(TextureUpdate update)
+{
+    MergePendingTexture(std::move(update), true);
+}
+
+void PersistentTerrainRenderer::MergePendingTexture(
+    TextureUpdate update, bool replaceEqual)
 {
     if (update.pages.empty() ||
         renderShuttingDown_.load(std::memory_order_acquire))
@@ -156,7 +164,8 @@ void PersistentTerrainRenderer::QueueTexture(TextureUpdate update)
             });
         if (it == pendingTexture_->pages.end())
             pendingTexture_->pages.push_back(std::move(incoming));
-        else if (incoming.imageryZoom >= it->imageryZoom)
+        else if (incoming.imageryZoom > it->imageryZoom ||
+                 (replaceEqual && incoming.imageryZoom == it->imageryZoom))
             *it = std::move(incoming);
     }
     pendingTexture_->changedPageCount = pendingTexture_->pages.size();
@@ -165,6 +174,11 @@ void PersistentTerrainRenderer::QueueTexture(TextureUpdate update)
 std::uint64_t PersistentTerrainRenderer::ActiveGeneration() const
 {
     return activeGeneration_.load(std::memory_order_relaxed);
+}
+
+std::uint64_t PersistentTerrainRenderer::ActiveCoverageRevision() const
+{
+    return activeCoverageRevision_.load(std::memory_order_acquire);
 }
 
 bool PersistentTerrainRenderer::HasActiveTerrain() const
@@ -237,6 +251,24 @@ PersistentTerrainRenderer::CreatePage(
     result.sourceTexture = RenderImage(page.textureName, page.texture);
     result.sourceTextureName = page.textureName;
     result.sourceTextureSize = page.textureSize;
+    result.sourceImageryZoom = page.imageryZoom;
+    // The near view can refine while the worker builds an expanded horizon.
+    // Keep finer resident imagery for the same geographic page across both
+    // coverage appends and recenter generations. A different dataset/runtime
+    // has its own prefix and must never inherit these pixels.
+    if (active_ && active_->resourcePrefix == snapshot.resourcePrefix)
+    {
+        const auto previous = std::find_if(active_->pages.begin(), active_->pages.end(),
+            [&](const PageSlot &candidate) { return candidate.key == page.key; });
+        if (previous != active_->pages.end() &&
+            previous->sourceImageryZoom > result.sourceImageryZoom)
+        {
+            result.sourceTexture = previous->sourceTexture;
+            result.sourceTextureName = previous->sourceTextureName;
+            result.sourceTextureSize = previous->sourceTextureSize;
+            result.sourceImageryZoom = previous->sourceImageryZoom;
+        }
+    }
     result.boundsMin = result.sourceMesh->Min();
     result.boundsMax = result.sourceMesh->Max();
     if (!MakePageResident(snapshot.resourcePrefix, snapshot.generation,
@@ -277,6 +309,8 @@ bool PersistentTerrainRenderer::MakePageResident(
         page.sourceTextureSize, page.sourceTextureSize);
     try
     {
+        if (!prepareOgre2TerrainMesh(scene_, page.sourceMesh.get()))
+            throw std::runtime_error("terrain mesh import failed for " + tileText(page.key));
         page.geometry = scene_->CreateMesh(page.sourceMesh.get());
         if (!page.geometry)
             throw std::runtime_error(
@@ -442,11 +476,19 @@ void PersistentTerrainRenderer::UpdateActivePageResidency()
     if (!cameraSet.complete)
     {
         for (auto &page : active_->pages)
+        {
+            if (page.startupWarmupFrames >= 0) continue;
             page.offscreenFrames = 0;
+            // Camera discovery can temporarily be incomplete during sensor
+            // reloads. Merely stopping eviction leaves previously evicted
+            // pages missing from the remaining camera's view.
+            MakePageResident(active_->resourcePrefix,
+                             active_->generation, page, true);
+        }
         if (!warnedNoResidencyCameras_)
         {
             logInfo("[DynamicTerrain][GPU-RESIDENCY] selected camera set is empty or incomplete; ",
-                    "keeping the current page working set");
+                    "restoring the complete page working set");
             warnedNoResidencyCameras_ = true;
         }
         return;
@@ -457,6 +499,7 @@ void PersistentTerrainRenderer::UpdateActivePageResidency()
     std::size_t unloaded = 0;
     for (auto &page : active_->pages)
     {
+        if (page.startupWarmupFrames >= 0) continue;
         bool visible = false;
         bool unknown = false;
         for (const auto &camera : cameraSet.cameras)
@@ -491,6 +534,11 @@ void PersistentTerrainRenderer::UpdateActivePageResidency()
         if (unknown)
         {
             page.offscreenFrames = 0;
+            // Unsupported projections must be conservative in both
+            // directions: restore pages as well as preventing eviction.
+            if (!resident && MakePageResident(active_->resourcePrefix,
+                                              active_->generation, page, true))
+                ++loaded;
             continue;
         }
 
@@ -530,53 +578,176 @@ PersistentTerrainRenderer::CreateSlot(
 
     Slot slot;
     slot.generation = snapshot->generation;
+    slot.coverageRevision = snapshot->coverageRevision;
     slot.centerTile = snapshot->centerTile;
     slot.resourcePrefix = snapshot->resourcePrefix;
     slot.warmupFrames = cfg_.visualWarmupFrames;
     slot.estimatedTextureBytes = snapshot->estimatedTextureBytes;
     slot.pages.reserve(snapshot->pages.size());
 
+    slot.uploading = snapshot;
+    return slot;
+}
+
+void PersistentTerrainRenderer::AdvanceStagingUpload()
+{
+    if (!staging_ || !staging_->uploading) return;
+    const auto began = std::chrono::steady_clock::now();
+    std::size_t uploaded = 0;
     try
     {
-        if (resourcePressureCandidate)
-            *resourcePressureCandidate = true;
-        for (const auto &page : snapshot->pages)
+        auto &slot = *staging_;
+        const auto &snapshot = *slot.uploading;
+        while (slot.pages.size() < snapshot.pages.size())
         {
-            auto uploaded = CreatePage(*snapshot, page);
-            if (!uploaded)
-                throw std::runtime_error(
-                    "invalid geographic page " + tileText(page.key));
-            slot.pages.push_back(std::move(*uploaded));
+            auto page = CreatePage(snapshot, snapshot.pages[slot.pages.size()]);
+            if (!page) throw std::runtime_error("invalid geographic page during staging");
+            slot.pages.push_back(std::move(*page));
+            ++uploaded;
+            const double elapsedMs = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - began).count();
+            if (uploaded >= static_cast<std::size_t>(cfg_.visualUploadPagesPerFrame) ||
+                elapsedMs >= cfg_.visualUploadBudgetMs) break;
         }
-
-        if (resourcePressureCandidate)
-            *resourcePressureCandidate = false;
-        logInfo("[DynamicTerrain][RENDER] staging page set uploaded generation=",
-                slot.generation,
-                " pages=", slot.pages.size(),
-                " estimated_resident_texture_mib=",
-                static_cast<double>(slot.estimatedTextureBytes) /
-                    (1024.0 * 1024.0),
-                " unique_gpu_textures=", textureReferences_.ResourceCount(),
-                " warmup_frames=", slot.warmupFrames,
-                " lighting=", cfg_.visualLightingEnabled ? "on" : "off",
-                " mapping=one-geographic-page-per-visual",
-                " page_uv=west-east/north-south-direct");
-        return slot;
+        if (slot.pages.size() == snapshot.pages.size())
+        {
+            slot.uploading.reset();
+            if (cfg_.diagnostics)
+                logInfo("[DynamicTerrain][RENDER] staging complete generation=", slot.generation,
+                        " pages=", slot.pages.size(), " warmup_frames=", slot.warmupFrames);
+        }
     }
-    catch (const std::exception &e)
+    catch (const std::exception &error)
     {
-        DestroySlot(slot);
-        logError("[DynamicTerrain][RENDER] failed to create staging page set generation=",
-                 snapshot->generation, " error=", e.what());
-        return std::nullopt;
+        logError("[DynamicTerrain][RENDER] staging failed; active terrain retained: ", error.what());
+        DestroySlot(*staging_); staging_.reset();
     }
     catch (...)
     {
-        DestroySlot(slot);
-        logError("[DynamicTerrain][RENDER] failed to create staging page set generation=",
-                 snapshot->generation, " unknown rendering exception");
-        return std::nullopt;
+        logError("[DynamicTerrain][RENDER] staging failed; active terrain retained");
+        DestroySlot(*staging_); staging_.reset();
+    }
+}
+
+bool PersistentTerrainRenderer::AdoptProgressiveSnapshot(
+    const std::shared_ptr<const TerrainSnapshot> &snapshot)
+{
+    if (!snapshot || !snapshot->progressiveInitial || snapshot->pages.empty()) return false;
+    if (active_ && (!active_->progressiveInitial || active_->generation != snapshot->generation ||
+             active_->resourcePrefix != snapshot->resourcePrefix ||
+             snapshot->coverageRevision < active_->coverageRevision))
+        return false;
+
+    std::unordered_map<TileKey, const TerrainPage *, TileKeyHash> incoming;
+    for (const auto &page : snapshot->pages)
+        if (!incoming.emplace(page.key, &page).second)
+        {
+            logError("[DynamicTerrain][STARTUP] rejected duplicate cumulative page");
+            return false;
+        }
+    if (!active_)
+    {
+        active_ = CreateSlot(snapshot);
+        if (!active_) return false;
+        active_->progressiveInitial = true;
+    }
+    for (const auto &page : active_->pages)
+    {
+        const auto found = incoming.find(page.key);
+        if (found == incoming.end() || !found->second->mesh || !page.sourceMesh ||
+            found->second->mesh->name != page.sourceMesh->Name())
+        {
+            logError("[DynamicTerrain][STARTUP] rejected non-cumulative snapshot; visible pages retained");
+            return false;
+        }
+    }
+    active_->coverageRevision = snapshot->coverageRevision;
+    active_->progressiveComplete = snapshot->progressiveComplete;
+    active_->estimatedTextureBytes = snapshot->estimatedTextureBytes;
+    active_->uploading = snapshot;
+    active_->uploadCursor = 0;
+    active_->pages.reserve(snapshot->pages.size());
+    return true;
+}
+
+void PersistentTerrainRenderer::AdvanceProgressiveUpload()
+{
+    if (!active_ || !active_->progressiveInitial) return;
+    auto &slot = *active_;
+    const auto began = std::chrono::steady_clock::now();
+    std::size_t uploaded = 0;
+    try
+    {
+        if (slot.uploading && !staging_)
+        {
+            const auto &snapshot = *slot.uploading;
+            while (slot.uploadCursor < snapshot.pages.size())
+            {
+                const auto &incoming = snapshot.pages[slot.uploadCursor];
+                const auto existing = std::find_if(slot.pages.begin(), slot.pages.end(),
+                    [&](const PageSlot &page) { return page.key == incoming.key; });
+                if (existing != slot.pages.end())
+                {
+                    existing->pageIndex = incoming.index;
+                    ++slot.uploadCursor;
+                    continue;
+                }
+                auto page = CreatePage(snapshot, incoming);
+                if (!page) throw std::runtime_error("invalid page during initial streaming");
+                page->startupWarmupFrames = cfg_.visualWarmupFrames;
+                slot.pages.push_back(std::move(*page));
+                ++slot.uploadCursor;
+                ++uploaded;
+                if (uploaded >= static_cast<std::size_t>(cfg_.visualUploadPagesPerFrame) ||
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - began).count()
+                        >= cfg_.visualUploadBudgetMs) break;
+            }
+        }
+    }
+    catch (const std::exception &error)
+    {
+        logError("[DynamicTerrain][STARTUP] page upload failed; completed pages retained: ", error.what());
+        slot.uploading.reset();
+    }
+    catch (...)
+    {
+        logError("[DynamicTerrain][STARTUP] page upload failed; completed pages retained");
+        slot.uploading.reset();
+    }
+
+    std::size_t visiblePages = 0;
+    for (const auto &page : slot.pages) visiblePages += page.startupWarmupFrames < 0;
+    for (auto &page : slot.pages)
+    {
+        if (page.startupWarmupFrames < 0) continue;
+        if (page.startupWarmupFrames > 0)
+        {
+            --page.startupWarmupFrames;
+            continue;
+        }
+        if (page.visual) page.visual->SetVisible(true);
+        page.startupWarmupFrames = -1;
+        ++visiblePages;
+        activeCenterX_.store(slot.centerTile.x, std::memory_order_relaxed);
+        activeCenterY_.store(slot.centerTile.y, std::memory_order_relaxed);
+        activeCenterZ_.store(slot.centerTile.z, std::memory_order_relaxed);
+        activeGeneration_.store(slot.generation, std::memory_order_release);
+        hasActive_.store(true, std::memory_order_release);
+        if (cfg_.diagnostics)
+            logInfo("[DynamicTerrain][STARTUP] page visible generation=", slot.generation,
+                " revision=", slot.coverageRevision, " page=", tileText(page.key),
+                " visible_pages=", visiblePages, " uploaded_pages=", slot.pages.size(),
+                " target_pages=", slot.uploading ? slot.uploading->pages.size() : slot.pages.size());
+    }
+    if (slot.uploading && slot.uploadCursor == slot.uploading->pages.size() &&
+        visiblePages == slot.pages.size())
+    {
+        activeCoverageRevision_.store(slot.coverageRevision, std::memory_order_release);
+        if (cfg_.diagnostics)
+            logInfo("[DynamicTerrain][STARTUP] revision active generation=", slot.generation,
+                " revision=", slot.coverageRevision, " pages=", slot.pages.size(),
+                " complete=", slot.progressiveComplete);
+        slot.uploading.reset();
     }
 }
 
@@ -584,6 +755,7 @@ void PersistentTerrainRenderer::ClearActiveState()
 {
     hasActive_.store(false, std::memory_order_release);
     activeGeneration_.store(0, std::memory_order_release);
+    activeCoverageRevision_.store(0, std::memory_order_release);
     activeCenterX_.store(0, std::memory_order_relaxed);
     activeCenterY_.store(0, std::memory_order_relaxed);
     activeCenterZ_.store(0, std::memory_order_relaxed);
@@ -593,35 +765,9 @@ std::optional<PersistentTerrainRenderer::Slot>
 PersistentTerrainRenderer::CreateSlotWithRecovery(
     const std::shared_ptr<const TerrainSnapshot> &snapshot)
 {
-    bool pressureCandidate = false;
-    auto slot = CreateSlot(snapshot, &pressureCandidate);
-    if (slot || !pressureCandidate || !active_)
-        return slot;
-
-    const auto oldGeneration = active_->generation;
-    logError("[DynamicTerrain][VRAM-RECOVERY] staging allocation failed for generation=",
-             snapshot ? snapshot->generation : 0,
-             "; releasing active generation=", oldGeneration,
-             " before one low-memory retry");
-    DestroySlot(*active_);
-    active_.reset();
-    ClearActiveState();
-
-    bool retryPressure = false;
-    slot = CreateSlot(snapshot, &retryPressure);
-    if (slot)
-    {
-        slot->warmupFrames = 0;
-        logInfo("[DynamicTerrain][VRAM-RECOVERY] low-memory staging upload succeeded generation=",
-                slot->generation, " old_generation_released=", oldGeneration);
-    }
-    else
-    {
-        logError("[DynamicTerrain][VRAM-RECOVERY] low-memory staging retry also failed generation=",
-                 snapshot ? snapshot->generation : 0,
-                 "; renderer remains without an active terrain until retry");
-    }
-    return slot;
+    // Failed staging never releases the last complete active generation.
+    // The runtime retries later; its renderer acknowledgement remains unchanged.
+    return CreateSlot(snapshot);
 }
 
 void PersistentTerrainRenderer::ApplyPendingTexture()
@@ -642,7 +788,18 @@ void PersistentTerrainRenderer::ApplyPendingTexture()
     if (staging_ && staging_->generation == update->generation)
         target = &*staging_;
     else if (active_ && active_->generation == update->generation)
+    {
         target = &*active_;
+        if (staging_ && staging_->resourcePrefix == active_->resourcePrefix)
+        {
+            // A final old-generation refinement can arrive after its page was
+            // copied into staging. Apply it to the replacement instead of
+            // sharpening the old view for one frame and then swapping it out
+            // for the older staged image. Geographic keys validate the mapping.
+            target = &*staging_;
+            update->generation = staging_->generation;
+        }
+    }
     if (!target)
     {
         if (cfg_.diagnostics)
@@ -655,8 +812,17 @@ void PersistentTerrainRenderer::ApplyPendingTexture()
 
     std::size_t applied = 0;
     std::size_t rejected = 0;
+    std::size_t processed = 0;
+    const auto began = std::chrono::steady_clock::now();
     for (const auto &pageUpdate : update->pages)
     {
+        if (processed != 0u &&
+            (processed >= static_cast<std::size_t>(cfg_.visualUploadPagesPerFrame) ||
+             std::chrono::duration<double, std::milli>(
+                 std::chrono::steady_clock::now() - began).count() >=
+                 cfg_.visualUploadBudgetMs))
+            break;
+        ++processed;
         auto pageIt = std::find_if(
             target->pages.begin(), target->pages.end(),
             [&](const PageSlot &page) { return page.key == pageUpdate.pageKey; });
@@ -670,6 +836,8 @@ void PersistentTerrainRenderer::ApplyPendingTexture()
         }
         if (pageIt->sourceTextureName == pageUpdate.textureName)
             continue;
+        if (pageUpdate.imageryZoom < pageIt->sourceImageryZoom)
+            continue;
 
         if (!pageIt->gpuResident || !pageIt->geometry || !pageIt->submesh ||
             !pageIt->material || !pageIt->textureReferenceHeld)
@@ -677,6 +845,7 @@ void PersistentTerrainRenderer::ApplyPendingTexture()
             pageIt->sourceTexture = RenderImage(pageUpdate.textureName, pageUpdate.texture);
             pageIt->sourceTextureName = pageUpdate.textureName;
             pageIt->sourceTextureSize = pageUpdate.textureSize;
+            pageIt->sourceImageryZoom = pageUpdate.imageryZoom;
             ++applied;
             continue;
         }
@@ -715,6 +884,7 @@ void PersistentTerrainRenderer::ApplyPendingTexture()
             pageIt->sourceTextureName.swap(preparedSourceName);
             pageIt->sourceTexture.swap(preparedSourceTexture);
             pageIt->sourceTextureSize = pageUpdate.textureSize;
+            pageIt->sourceImageryZoom = pageUpdate.imageryZoom;
 
             DestroyPageMaterial(replacementResource);
             ++applied;
@@ -735,9 +905,22 @@ void PersistentTerrainRenderer::ApplyPendingTexture()
         }
     }
 
+    const auto generation = update->generation;
+    const auto deferred = update->pages.size() - processed;
+    if (deferred != 0u)
+    {
+        update->pages.erase(update->pages.begin(),
+                            update->pages.begin() + processed);
+        update->changedPageCount = update->pages.size();
+        // New worker updates may have arrived while the render thread was
+        // uploading. An older deferred page cannot replace an equally fine
+        // newer update, and unrelated pages must remain queued.
+        MergePendingTexture(std::move(*update), false);
+    }
     logInfo("[DynamicTerrain][RENDER] progressive page textures applied generation=",
-            update->generation, " applied=", applied,
+            generation, " applied=", applied,
             " rejected=", rejected,
+            " deferred=", deferred,
             " resident_named_textures=", textureReferences_.ResourceCount(),
             " destroyed_textures=", destroyedTextures_);
 }
@@ -766,13 +949,45 @@ void PersistentTerrainRenderer::OnPreRender()
                     generation);
     }
 
+    // Only the first generation may grow in place. The worker publishes
+    // cumulative immutable snapshots, so a bounded latest-only queue can
+    // supersede a target without discarding already uploaded or visible pages.
+    std::shared_ptr<const TerrainSnapshot> progressive;
+    {
+        std::lock_guard<std::mutex> lock(queueMutex_);
+        if (!staging_ && pendingSnapshot_ && pendingSnapshot_->progressiveInitial &&
+            (!active_ || (active_->progressiveInitial &&
+                active_->generation == pendingSnapshot_->generation &&
+                pendingSnapshot_->coverageRevision >= active_->coverageRevision)))
+        {
+            progressive = std::move(pendingSnapshot_);
+            pendingSnapshot_.reset();
+        }
+    }
+    if (progressive)
+    {
+        try { AdoptProgressiveSnapshot(progressive); }
+        catch (const std::exception &error)
+        {
+            if (active_ && active_->progressiveInitial) active_->uploading.reset();
+            logError("[DynamicTerrain][STARTUP] cumulative target failed; visible pages retained: ", error.what());
+        }
+        catch (...)
+        {
+            if (active_ && active_->progressiveInitial) active_->uploading.reset();
+            logError("[DynamicTerrain][STARTUP] cumulative target failed; visible pages retained");
+        }
+    }
+
     if (staging_)
     {
         std::shared_ptr<const TerrainSnapshot> newer;
         {
             std::lock_guard<std::mutex> lock(queueMutex_);
             if (pendingSnapshot_ &&
-                pendingSnapshot_->generation > staging_->generation)
+                (pendingSnapshot_->generation > staging_->generation ||
+                 (pendingSnapshot_->generation == staging_->generation &&
+                  pendingSnapshot_->coverageRevision > staging_->coverageRevision)))
             {
                 newer = std::move(pendingSnapshot_);
                 pendingSnapshot_.reset();
@@ -796,7 +1011,15 @@ void PersistentTerrainRenderer::OnPreRender()
         {
             std::lock_guard<std::mutex> lock(queueMutex_);
             if (pendingSnapshot_ &&
-                (!active_ || pendingSnapshot_->generation > active_->generation))
+                // A worker can publish between this tick's append check and
+                // this check. Never route that cumulative target into hidden
+                // replacement staging; it will append on the next tick.
+                !(pendingSnapshot_->progressiveInitial &&
+                  (!active_ || (active_->progressiveInitial &&
+                   pendingSnapshot_->generation == active_->generation))) &&
+                (!active_ || pendingSnapshot_->generation > active_->generation ||
+                 (pendingSnapshot_->generation == active_->generation &&
+                  pendingSnapshot_->coverageRevision > active_->coverageRevision)))
             {
                 pending = std::move(pendingSnapshot_);
                 pendingSnapshot_.reset();
@@ -806,9 +1029,13 @@ void PersistentTerrainRenderer::OnPreRender()
             staging_ = CreateSlotWithRecovery(pending);
     }
 
-    ApplyPendingTexture();
+    AdvanceStagingUpload();
+    AdvanceProgressiveUpload();
+    if ((!staging_ || !staging_->uploading) &&
+        (!active_ || !active_->progressiveInitial || !active_->uploading))
+        ApplyPendingTexture();
 
-    if (staging_)
+    if (staging_ && !staging_->uploading)
     {
         if (staging_->warmupFrames > 0)
         {
@@ -831,12 +1058,12 @@ void PersistentTerrainRenderer::OnPreRender()
             activeCenterY_.store(active_->centerTile.y, std::memory_order_relaxed);
             activeCenterZ_.store(active_->centerTile.z, std::memory_order_relaxed);
             activeGeneration_.store(active_->generation, std::memory_order_release);
+            activeCoverageRevision_.store(active_->coverageRevision, std::memory_order_release);
             hasActive_.store(true, std::memory_order_release);
-            logInfo("[DynamicTerrain][RENDER] atomic A/B swap generation=",
-                    active_->generation,
-                    " pages=", active_->pages.size(),
-                    " resident_named_textures=",
-                    textureReferences_.ResourceCount());
+            if (cfg_.diagnostics)
+                logInfo("[DynamicTerrain][RENDER] atomic A/B swap generation=",
+                        active_->generation, " pages=", active_->pages.size(),
+                        " resident_named_textures=", textureReferences_.ResourceCount());
         }
     }
 

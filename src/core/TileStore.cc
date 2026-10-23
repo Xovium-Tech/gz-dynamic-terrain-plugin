@@ -2,6 +2,11 @@
 
 #include <curl/curl.h>
 #include <opencv2/imgcodecs.hpp>
+#if defined(XOVIUM_PRIVATE_JPEG)
+#include "ue_px4/terrain_image.hpp"
+#else
+#include "JpegValidation.hh"
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -17,83 +22,55 @@
 
 namespace dynamic_terrain
 {
-namespace
+TileStoreDiagnostics TileStore::Diagnostics() const
 {
-size_t curlWrite(void *data, size_t size, size_t count, void *user)
-{
-    auto *bytes = static_cast<std::vector<unsigned char> *>(user);
-    const std::size_t total = size * count;
-    const auto *begin = static_cast<unsigned char *>(data);
-    bytes->insert(bytes->end(), begin, begin + total);
-    return total;
+    TileStoreDiagnostics result;
+    result.downloads = downloader_.Diagnostics();
+    std::scoped_lock lock(demMutex_, imageryMutex_);
+    result.decodedDemBytes = demMemoryBytes_;
+    result.decodedDemEntries = demMemory_.size();
+    result.decodedImageryBytes = imageryMemoryBytes_;
+    result.decodedImageryEntries = imageryMemory_.size();
+    return result;
 }
 
+namespace
+{
 bool fileReady(const fs::path &path)
 {
     std::error_code ec;
-    return fs::exists(path, ec) && fs::is_regular_file(path, ec) &&
-           fs::file_size(path, ec) > 0;
+    return fs::is_regular_file(path, ec) && fs::file_size(path, ec) > 0 && !ec;
 }
 
-bool writeBinaryAtomic(const fs::path &path,
-                       const std::vector<unsigned char> &bytes)
+bool validateRasterBytes(const std::vector<unsigned char> &bytes)
 {
-    std::error_code ec;
-    fs::create_directories(path.parent_path(), ec);
-    const fs::path temp = path.string() + ".part." +
-        std::to_string(std::hash<std::thread::id>{}(std::this_thread::get_id())) +
-        "." + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
-    {
-        std::ofstream out(temp, std::ios::binary | std::ios::trunc);
-        if (!out)
-            return false;
-        out.write(reinterpret_cast<const char *>(bytes.data()),
-                  static_cast<std::streamsize>(bytes.size()));
-        if (!out.good())
-            return false;
-    }
-    fs::rename(temp, path, ec);
-    if (!ec)
-        return true;
-    if (fileReady(path))
-    {
-        fs::remove(temp, ec);
-        return true;
-    }
-    fs::remove(temp, ec);
-    return false;
-}
-
-struct Transfer
-{
-    DownloadSpec spec;
-    CURL *easy{nullptr};
-    std::vector<unsigned char> bytes;
-    char errorBuffer[CURL_ERROR_SIZE]{};
-    int attempt{0};
-};
-
-void configureEasy(Transfer &transfer, const Config &cfg)
-{
-    curl_easy_reset(transfer.easy);
-    transfer.bytes.clear();
-    transfer.errorBuffer[0] = '\0';
-    curl_easy_setopt(transfer.easy, CURLOPT_URL, transfer.spec.url.c_str());
-    curl_easy_setopt(transfer.easy, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(transfer.easy, CURLOPT_FAILONERROR, 1L);
-    curl_easy_setopt(transfer.easy, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(transfer.easy, CURLOPT_TCP_KEEPALIVE, 1L);
-    curl_easy_setopt(transfer.easy, CURLOPT_TIMEOUT_MS,
-                     static_cast<long>(cfg.httpTimeoutMs));
-    curl_easy_setopt(transfer.easy, CURLOPT_CONNECTTIMEOUT_MS,
-                     static_cast<long>(std::min(cfg.httpTimeoutMs, 3000u)));
-    curl_easy_setopt(transfer.easy, CURLOPT_USERAGENT, cfg.userAgent.c_str());
-    curl_easy_setopt(transfer.easy, CURLOPT_WRITEFUNCTION, curlWrite);
-    curl_easy_setopt(transfer.easy, CURLOPT_WRITEDATA, &transfer.bytes);
-    curl_easy_setopt(transfer.easy, CURLOPT_ERRORBUFFER, transfer.errorBuffer);
-#if LIBCURL_VERSION_NUM >= 0x072F00
-    curl_easy_setopt(transfer.easy, CURLOPT_PIPEWAIT, 1L);
+#if defined(XOVIUM_PRIVATE_JPEG)
+    return !loadTerrainImageBytes(bytes.data(), bytes.size()).empty();
+#else
+    if (bytes.size() >= 2 && bytes[0] == 0xff && bytes[1] == 0xd8)
+        return detail::ValidateJpeg(bytes);
+    return !cv::imdecode(bytes, cv::IMREAD_COLOR).empty();
 #endif
+}
+
+cv::Mat loadRasterFile(const std::string &path)
+{
+#if defined(XOVIUM_PRIVATE_JPEG)
+    return loadTerrainImage(path);
+#else
+    return cv::imread(path, cv::IMREAD_COLOR);
+#endif
+}
+
+DownloadCacheOptions downloadOptions(const Config &cfg)
+{
+    DownloadCacheOptions options;
+    options.concurrency = cfg.downloadConcurrency;
+    options.perHost = cfg.downloadPerHost;
+    options.retries = cfg.downloadRetries;
+    options.timeoutMs = cfg.httpTimeoutMs;
+    options.userAgent = cfg.userAgent;
+    return options;
 }
 
 std::string safeName(std::string value)
@@ -108,19 +85,6 @@ std::int64_t positiveModulo(std::int64_t value, std::int64_t modulus)
 {
     const std::int64_t result = value % modulus;
     return result < 0 ? result + modulus : result;
-}
-
-struct DownloadCoordinator
-{
-    std::mutex mutex;
-    std::condition_variable cv;
-    std::unordered_set<std::string> inFlight;
-};
-
-DownloadCoordinator &downloadCoordinator()
-{
-    static DownloadCoordinator coordinator;
-    return coordinator;
 }
 
 std::atomic<std::uint64_t> &terrainInstanceCounter()
@@ -163,299 +127,20 @@ double ElevationMosaic::Sample(double latDeg, double lonDeg) const
     return top * (1.0 - ty) + bottom * ty;
 }
 
-BatchDownloader::BatchDownloader(Config config) : cfg_(std::move(config)) {}
+BatchDownloader::BatchDownloader(Config config)
+    : cfg_(std::move(config)), cache_(downloadOptions(cfg_)) {}
 
 DownloadStats BatchDownloader::Ensure(const std::vector<DownloadSpec> &requests,
                                       std::vector<fs::path> *failedPaths) const
 {
-    DownloadStats stats;
-    const auto started = std::chrono::steady_clock::now();
-
-    std::unordered_set<std::string> seen;
-    std::vector<DownloadSpec> candidates;
-    candidates.reserve(requests.size());
-    for (const auto &request : requests)
-    {
-        ++stats.requested;
-        const std::string key = request.path.string();
-        if (!seen.insert(key).second)
-            continue;
-        if (fileReady(request.path))
-        {
-            ++stats.cached;
-            continue;
-        }
-        candidates.push_back(request);
-    }
-
-    if (candidates.empty())
-    {
-        stats.elapsedSec = std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - started).count();
-        return stats;
-    }
-
-    auto &coordinator = downloadCoordinator();
-    std::vector<DownloadSpec> owned;
-    std::vector<DownloadSpec> waiting;
-    {
-        std::lock_guard<std::mutex> lock(coordinator.mutex);
-        for (const auto &request : candidates)
-        {
-            const std::string key = request.path.string();
-            if (coordinator.inFlight.insert(key).second)
-                owned.push_back(request);
-            else
-                waiting.push_back(request);
-        }
-    }
-
-    auto releaseOwned = [&]
-    {
-        std::lock_guard<std::mutex> lock(coordinator.mutex);
-        for (const auto &request : owned)
-            coordinator.inFlight.erase(request.path.string());
-        coordinator.cv.notify_all();
-    };
-
-    std::vector<DownloadSpec> round = owned;
-    for (int attempt = 0; attempt <= cfg_.downloadRetries && !round.empty(); ++attempt)
-    {
-        CURLM *multi = curl_multi_init();
-        if (!multi)
-        {
-            if (attempt < cfg_.downloadRetries)
-            {
-                std::this_thread::sleep_for(
-                    std::chrono::milliseconds(150 * (attempt + 1)));
-                continue;
-            }
-            stats.failed += round.size();
-            if (failedPaths)
-                for (const auto &request : round)
-                    failedPaths->push_back(request.path);
-            break;
-        }
-#if LIBCURL_VERSION_NUM >= 0x071E00
-        curl_multi_setopt(multi, CURLMOPT_MAX_TOTAL_CONNECTIONS,
-                          static_cast<long>(cfg_.downloadConcurrency));
-        curl_multi_setopt(multi, CURLMOPT_MAX_HOST_CONNECTIONS,
-                          static_cast<long>(cfg_.downloadPerHost));
-#endif
-
-        std::unordered_map<CURL *, std::unique_ptr<Transfer>> active;
-        std::vector<DownloadSpec> retry;
-        std::size_t nextIndex = 0;
-        bool multiHealthy = true;
-
-        auto startMore = [&]()
-        {
-            while (multiHealthy &&
-                   active.size() < static_cast<std::size_t>(cfg_.downloadConcurrency) &&
-                   nextIndex < round.size())
-            {
-                const auto spec = round[nextIndex++];
-                auto transfer = std::make_unique<Transfer>();
-                transfer->spec = spec;
-                transfer->attempt = attempt;
-                transfer->easy = curl_easy_init();
-                if (!transfer->easy)
-                {
-                    retry.push_back(spec);
-                    continue;
-                }
-                configureEasy(*transfer, cfg_);
-                CURL *handle = transfer->easy;
-                const CURLMcode addCode = curl_multi_add_handle(multi, handle);
-                if (addCode != CURLM_OK)
-                {
-                    curl_easy_cleanup(handle);
-                    transfer->easy = nullptr;
-                    retry.push_back(spec);
-                    continue;
-                }
-                active.emplace(handle, std::move(transfer));
-            }
-        };
-
-        startMore();
-        if (cfg_.diagnostics)
-            logInfo("[DynamicTerrain][HTTP] batch start files=", round.size(),
-                    " active_window=", cfg_.downloadConcurrency,
-                    " per_host=", cfg_.downloadPerHost,
-                    " attempt=", attempt + 1);
-
-        int stillRunning = 0;
-        CURLMcode multiCode = curl_multi_perform(multi, &stillRunning);
-        if (multiCode != CURLM_OK)
-            multiHealthy = false;
-
-        while (multiHealthy && (!active.empty() || nextIndex < round.size()))
-        {
-            if (stillRunning > 0)
-            {
-                int numfds = 0;
-#if LIBCURL_VERSION_NUM >= 0x074200
-                multiCode = curl_multi_poll(multi, nullptr, 0, 500, &numfds);
-#else
-                multiCode = curl_multi_wait(multi, nullptr, 0, 500, &numfds);
-#endif
-                if (multiCode != CURLM_OK)
-                {
-                    multiHealthy = false;
-                    break;
-                }
-            }
-
-            multiCode = curl_multi_perform(multi, &stillRunning);
-            if (multiCode != CURLM_OK)
-            {
-                multiHealthy = false;
-                break;
-            }
-
-            int messages = 0;
-            while (CURLMsg *message = curl_multi_info_read(multi, &messages))
-            {
-                if (message->msg != CURLMSG_DONE)
-                    continue;
-                auto it = active.find(message->easy_handle);
-                if (it == active.end())
-                    continue;
-
-                Transfer &transfer = *it->second;
-                long status = 0;
-                curl_easy_getinfo(message->easy_handle,
-                                  CURLINFO_RESPONSE_CODE, &status);
-                const bool ok = message->data.result == CURLE_OK &&
-                                status >= 200 && status < 400 &&
-                                !transfer.bytes.empty() &&
-                                writeBinaryAtomic(transfer.spec.path,
-                                                  transfer.bytes);
-                if (ok)
-                {
-                    ++stats.downloaded;
-                    if (cfg_.diagnostics)
-                        logInfo("[DynamicTerrain][HTTP] ready ",
-                                transfer.spec.label,
-                                " bytes=", transfer.bytes.size());
-                }
-                else
-                {
-                    retry.push_back(transfer.spec);
-                    if (cfg_.diagnostics)
-                    {
-                        const char *curlText =
-                            curl_easy_strerror(message->data.result);
-                        logInfo("[DynamicTerrain][HTTP] retry candidate ",
-                                transfer.spec.label,
-                                " status=", status,
-                                " curl=",
-                                static_cast<int>(message->data.result),
-                                " error=", (transfer.errorBuffer[0] ?
-                                    transfer.errorBuffer : curlText));
-                    }
-                }
-
-                curl_multi_remove_handle(multi, message->easy_handle);
-                curl_easy_cleanup(message->easy_handle);
-                transfer.easy = nullptr;
-                active.erase(it);
-            }
-
-            startMore();
-            if (!active.empty())
-            {
-                multiCode = curl_multi_perform(multi, &stillRunning);
-                if (multiCode != CURLM_OK)
-                    multiHealthy = false;
-            }
-        }
-
-        if (!multiHealthy)
-        {
-            for (auto &entry : active)
-                retry.push_back(entry.second->spec);
-            while (nextIndex < round.size())
-                retry.push_back(round[nextIndex++]);
-        }
-
-        for (auto &entry : active)
-        {
-            CURL *handle = entry.first;
-            curl_multi_remove_handle(multi, handle);
-            curl_easy_cleanup(handle);
-            entry.second->easy = nullptr;
-        }
-        active.clear();
-        curl_multi_cleanup(multi);
-
-        std::sort(retry.begin(), retry.end(), [](const auto &a, const auto &b)
-        {
-            return a.path.string() < b.path.string();
-        });
-        retry.erase(std::unique(retry.begin(), retry.end(), [](const auto &a, const auto &b)
-        {
-            return a.path == b.path;
-        }), retry.end());
-
-        if (attempt == cfg_.downloadRetries && !retry.empty())
-        {
-            for (const auto &request : retry)
-            {
-                if (fileReady(request.path))
-                    continue;
-                ++stats.failed;
-                if (failedPaths)
-                    failedPaths->push_back(request.path);
-                logError("[DynamicTerrain][HTTP] exhausted retries ",
-                         request.label, " url=", redactUrl(request.url));
-            }
-            retry.clear();
-        }
-        else if (!retry.empty())
-        {
-            const int backoffMs = std::min(2000, 250 * (1 << attempt));
-            std::this_thread::sleep_for(std::chrono::milliseconds(backoffMs));
-        }
-        round = std::move(retry);
-    }
-
-    releaseOwned();
-
-    if (!waiting.empty())
-    {
-        std::unique_lock<std::mutex> lock(coordinator.mutex);
-        coordinator.cv.wait(lock, [&]
-        {
-            for (const auto &request : waiting)
-                if (coordinator.inFlight.count(request.path.string()) != 0)
-                    return false;
-            return true;
-        });
-        lock.unlock();
-
-        for (const auto &request : waiting)
-        {
-            if (fileReady(request.path))
-                ++stats.cached;
-            else
-            {
-                ++stats.failed;
-                if (failedPaths)
-                    failedPaths->push_back(request.path);
-            }
-        }
-    }
-
-    stats.elapsedSec = std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - started).count();
+    auto stats = cache_.Ensure(requests, failedPaths, ScopedDownloadContext::Check(),
+                              ScopedDownloadContext::Priority());
     if (cfg_.diagnostics)
-        logInfo("[DynamicTerrain][HTTP] batch done requested=", stats.requested,
-                " cached=", stats.cached,
-                " downloaded=", stats.downloaded,
-                " failed=", stats.failed,
-                " time=", stats.elapsedSec, "s");
+        logInfo("[DynamicTerrain][HTTP] requested=", stats.requested,
+                " cached=", stats.cached, " downloaded=", stats.downloaded,
+                " failed=", stats.failed, " cancelled=", stats.cancelled,
+                " bytes=", stats.bytes, " connections=", stats.connections,
+                " retries=", stats.retries, " time=", stats.elapsedSec, "s");
     return stats;
 }
 
@@ -464,7 +149,7 @@ TileStore::TileStore(Config config, std::shared_ptr<const GeographicTransform> s
       spherical_(std::move(spherical)),
       cacheRoot_(expandHome(cfg_.cacheDir)),
       imagery_(resolveImageryProvider(cfg_)),
-      downloader_(cfg_)
+      downloader_(cfg_), terrarium_(lower(cfg_.elevationProvider) == "terrarium")
 {
     if (!spherical_)
         throw std::invalid_argument("TileStore requires a geographic transform");
@@ -479,7 +164,7 @@ TileStore::TileStore(Config config, std::shared_ptr<const GeographicTransform> s
 
 fs::path TileStore::ImageryPath(const TileKey &key) const
 {
-    return cacheRoot_ / "imagery" / safeName(imagery_.name) /
+    return cacheRoot_ / "imagery" / TerrainCacheNamespace(imagery_.name, cfg_.imageryUrl, imagery_.extension) /
            std::to_string(key.z) / std::to_string(key.x) /
            (std::to_string(key.y) + "." + imagery_.extension);
 }
@@ -488,7 +173,7 @@ fs::path TileStore::ElevationPath(const TileKey &key) const
 {
     const std::string provider = lower(cfg_.elevationProvider);
     const std::string ext = provider == "terrarium" ? "png" : "webp";
-    return cacheRoot_ / "elevation" / safeName(provider) /
+    return cacheRoot_ / "elevation" / TerrainCacheNamespace(provider, cfg_.elevationUrl, ext) /
            std::to_string(key.z) / std::to_string(key.x) /
            (std::to_string(key.y) + "." + ext);
 }
@@ -519,15 +204,16 @@ bool TileStore::EnsureImagery(const std::vector<TileKey> &keys,
     std::vector<DownloadSpec> requests;
     requests.reserve(keys.size());
     for (const auto &key : keys)
-        requests.push_back({"IMG " + tileText(key), ImageryUrl(key), ImageryPath(key)});
-    const auto stats = downloader_.Ensure(requests);
+        requests.push_back({"IMG " + tileText(key), ImageryUrl(key), ImageryPath(key), validateRasterBytes});
+    std::vector<fs::path> failedPaths;
+    const auto stats = downloader_.Ensure(requests, &failedPaths);
     if (failed)
     {
         for (const auto &key : keys)
-            if (!fileReady(ImageryPath(key)))
+            if (std::find(failedPaths.begin(), failedPaths.end(), fs::absolute(ImageryPath(key)).lexically_normal()) != failedPaths.end())
                 failed->push_back(key);
     }
-    return stats.failed == 0;
+    return stats.failed == 0 && stats.cancelled == 0;
 }
 
 bool TileStore::EnsureElevation(const std::vector<TileKey> &keys,
@@ -539,15 +225,16 @@ bool TileStore::EnsureElevation(const std::vector<TileKey> &keys,
     std::vector<DownloadSpec> requests;
     requests.reserve(keys.size());
     for (const auto &key : keys)
-        requests.push_back({"DEM " + tileText(key), ElevationUrl(key), ElevationPath(key)});
-    const auto stats = downloader_.Ensure(requests);
+        requests.push_back({"DEM " + tileText(key), ElevationUrl(key), ElevationPath(key), validateRasterBytes});
+    std::vector<fs::path> failedPaths;
+    const auto stats = downloader_.Ensure(requests, &failedPaths);
     if (failed)
     {
         for (const auto &key : keys)
-            if (!fileReady(ElevationPath(key)))
+            if (std::find(failedPaths.begin(), failedPaths.end(), fs::absolute(ElevationPath(key)).lexically_normal()) != failedPaths.end())
                 failed->push_back(key);
     }
-    return stats.failed == 0;
+    return stats.failed == 0 && stats.cancelled == 0;
 }
 
 bool TileStore::EnsureElevationForBounds(const TileBounds &bounds, int zoom,
@@ -627,6 +314,7 @@ std::optional<ElevationMosaic> TileStore::BuildElevationMosaic(
 
     for (const auto &[key, raster] : rasters)
     {
+        if (ScopedDownloadContext::Cancelled()) { error = "elevation build cancelled"; return std::nullopt; }
         const int ox = (key.x - rect.minX) * tileWidth;
         const int oy = (key.y - rect.minY) * tileHeight;
         cv::Mat dst = mosaic.heights(cv::Rect(ox, oy, tileWidth, tileHeight));
@@ -653,10 +341,43 @@ double TileStore::ElevationAlignmentOffset(int zoom)
 
 cv::Mat TileStore::LoadImagery(const TileKey &key) const
 {
+    // Serialise only equal hash stripes during decode, never the entire cache.
+    auto &stripe = imageryFileMutexes_[TileKeyHash{}(key) % imageryFileMutexes_.size()];
+    std::lock_guard<std::mutex> stripeLock(stripe);
+    {
+        std::lock_guard<std::mutex> lock(imageryMutex_);
+        const auto found = imageryMemory_.find(key);
+        if (found != imageryMemory_.end())
+        {
+            imageryLru_.splice(imageryLru_.begin(), imageryLru_, imageryLruPos_.at(key));
+            return found->second;
+        }
+    }
     const auto path = ImageryPath(key);
-    if (!fileReady(path))
-        return {};
-    return cv::imread(path.string(), cv::IMREAD_COLOR);
+    if (!fileReady(path) || ScopedDownloadContext::Cancelled()) return {};
+    cv::Mat decoded = loadRasterFile(path.string());
+    if (decoded.empty())
+    {
+        downloader_.InvalidateValidation(path);
+        const auto repaired = downloader_.Ensure({{"IMG " + tileText(key), ImageryUrl(key), path, validateRasterBytes}});
+        if (repaired.failed || repaired.cancelled) return {};
+        decoded = loadRasterFile(path.string());
+        if (decoded.empty()) return {};
+    }
+    const std::size_t bytes = decoded.total() * decoded.elemSize();
+    const std::size_t limit = cfg_.decodedImageryCacheMb * 1024ull * 1024ull;
+    if (limit == 0 || bytes > limit) return decoded;
+    std::lock_guard<std::mutex> lock(imageryMutex_);
+    while (!imageryLru_.empty() && imageryMemoryBytes_ + bytes > limit)
+    {
+        const auto victim = imageryLru_.back();
+        const auto &raster = imageryMemory_.at(victim);
+        imageryMemoryBytes_ -= raster.total() * raster.elemSize();
+        imageryMemory_.erase(victim); imageryLruPos_.erase(victim); imageryLru_.pop_back();
+    }
+    imageryLru_.push_front(key); imageryLruPos_[key] = imageryLru_.begin();
+    imageryMemory_.emplace(key, decoded); imageryMemoryBytes_ += bytes;
+    return decoded;
 }
 
 void TileStore::TouchDemLru(const TileKey &key, std::size_t bytes)
@@ -719,7 +440,12 @@ std::shared_ptr<cv::Mat> TileStore::LoadElevationRaster(const TileKey &key)
             return {};
     }
 
-    cv::Mat decoded = cv::imread(ElevationPath(key).string(), cv::IMREAD_COLOR);
+    cv::Mat decoded = loadRasterFile(ElevationPath(key).string());
+    if (decoded.empty() && !ScopedDownloadContext::Cancelled())
+    {
+        downloader_.InvalidateValidation(ElevationPath(key));
+        if (EnsureElevation({key})) decoded = loadRasterFile(ElevationPath(key).string());
+    }
     if (decoded.empty())
     {
         logError("[DynamicTerrain][DEM] decode failed ", tileText(key),
@@ -728,6 +454,8 @@ std::shared_ptr<cv::Mat> TileStore::LoadElevationRaster(const TileKey &key)
     }
     auto raster = std::make_shared<cv::Mat>(std::move(decoded));
     const std::size_t bytes = raster->total() * raster->elemSize();
+    const std::size_t limit = cfg_.decodedDemCacheMb * 1024ull * 1024ull;
+    if (limit == 0 || bytes > limit) return raster;
     {
         std::lock_guard<std::mutex> lock(demMutex_);
         demMemory_[key] = raster;
@@ -742,7 +470,7 @@ double TileStore::DecodeHeight(const cv::Vec3b &bgr) const
     const double b = bgr[0];
     const double g = bgr[1];
     const double r = bgr[2];
-    if (lower(cfg_.elevationProvider) == "terrarium")
+    if (terrarium_)
         return r * 256.0 + g + b / 256.0 - 32768.0;
     return ((r * 256.0 * 256.0 + g * 256.0 + b) * 0.1) - 10000.0;
 }

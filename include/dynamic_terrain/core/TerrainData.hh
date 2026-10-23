@@ -36,6 +36,7 @@ struct ImageData
 
 struct TerrainPage
 {
+    bool visualOnly{false};
     TileKey key;
     std::size_t index{0};
     std::string submeshName;
@@ -50,6 +51,9 @@ struct TerrainPage
 struct TerrainSnapshot
 {
     std::uint64_t generation{0};
+    std::uint64_t coverageRevision{0};
+    bool progressiveInitial{false};
+    bool progressiveComplete{true};
     TileKey centerTile;
     TileRect geometryRect;
     TileBounds bounds;

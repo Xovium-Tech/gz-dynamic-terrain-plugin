@@ -79,25 +79,7 @@ protected:
                     cfg.diagnostics = false;
                     render_->renderer = std::make_unique<PersistentTerrainRenderer>(cfg, render_->events);
                 }
-                if (!render_->sent || render_->sent->generation != incoming->generation)
-                    render_->renderer->QueueSnapshot(incoming);
-                else
-                {
-                    TextureUpdate update;
-                    update.generation = incoming->generation;
-                    for (std::size_t i = 0; i < incoming->pages.size(); ++i)
-                    {
-                        const auto &page = incoming->pages[i];
-                        if (page.textureName == render_->sent->pages[i].textureName) continue;
-                        TexturePageUpdate item;
-                        item.pageIndex = i; item.pageKey = page.key;
-                        item.submeshName = page.submeshName;
-                        item.texture = page.texture; item.textureName = page.textureName;
-                        item.imageryZoom = page.imageryZoom; item.textureSize = page.textureSize;
-                        update.pages.push_back(std::move(item));
-                    }
-                    render_->renderer->QueueTexture(std::move(update));
-                }
+                queueGuiSnapshot(*render_->renderer, render_->sent.get(), incoming);
                 render_->sent = std::move(incoming);
             }
             render_->events.Emit<gz::sim::events::PreRender>();
@@ -137,6 +119,7 @@ private:
         std::shared_ptr<TerrainSnapshot> previous;
         std::string previousRevision;
         std::uint64_t generation = 0;
+        std::uint64_t sourceGeneration = 0;
         unsigned failures = 0;
         const std::string viewerSuffix = "_viewer" + std::to_string(
             std::chrono::steady_clock::now().time_since_epoch().count());
@@ -178,6 +161,13 @@ private:
                     cache = std::move(retained);
                     auto snapshot = std::make_shared<TerrainSnapshot>();
                     snapshot->resourcePrefix = manifest.prefix() + viewerSuffix;
+                    snapshot->coverageRevision = manifest.coverage_revision();
+                    snapshot->progressiveInitial = manifest.progressive_initial();
+                    snapshot->progressiveComplete = !snapshot->progressiveInitial || manifest.progressive_complete();
+                    const bool expandedGeneration = previous && manifest.generation() != 0 &&
+                        sourceGeneration == manifest.generation() &&
+                        previous->resourcePrefix == snapshot->resourcePrefix &&
+                        snapshot->coverageRevision > previous->coverageRevision;
                     bool sameGeometry = previous &&
                         previous->resourcePrefix == snapshot->resourcePrefix &&
                         previous->pages.size() == static_cast<std::size_t>(manifest.pages_size());
@@ -206,11 +196,13 @@ private:
                             cache.emplace(key, std::move(page));
                         }
                         snapshot->pages.push_back(cache.at(key));
+                        snapshot->pages.back().index = static_cast<std::size_t>(i);
                         sameGeometry = sameGeometry && previous->pages[i].mesh->name == info.mesh_name() + viewerSuffix;
                         snapshot->estimatedTextureBytes += mipmappedRgbaBytes(
                             info.texture_size(), info.texture_size());
                     }
-                    snapshot->generation = sameGeometry ? previous->generation : ++generation;
+                    snapshot->generation = sameGeometry || expandedGeneration ? previous->generation : ++generation;
+                    sourceGeneration = manifest.generation();
                     snapshot->centerTile = snapshot->pages[snapshot->pages.size()/2].key;
                     {
                         std::lock_guard<std::mutex> lock(mutex_);

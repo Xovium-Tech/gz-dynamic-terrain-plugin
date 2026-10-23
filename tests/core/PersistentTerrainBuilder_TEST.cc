@@ -433,14 +433,14 @@ void testRefinedPageCache(std::size_t budgetMb, int textureSize,
         CHECK(image.expired());
 }
 
-void testRefinedPixelsSurviveRecenter()
+void testRefinedPixelsSurviveRecenter(bool pin = false, int targetZoom = 15)
 {
     TemporaryDirectory temp;
     auto config = makeConfig(temp.Path());
     config.visualRefineTexture = true;
     config.visualPageTextureMaxSize = 512;
-    config.visualImageryLodTable = {{1000000.0, 15}};
-    config.visualPageCacheMb = 2;
+    config.visualImageryLodTable = {{1000000.0, targetZoom}};
+    config.visualPageCacheMb = pin ? 0 : 2;
     dynamic_terrain::normalizeConfig(config);
     auto store = std::make_shared<dynamic_terrain::TileStore>(
         config, makeSphericalCoordinates());
@@ -457,17 +457,32 @@ void testRefinedPixelsSurviveRecenter()
     auto first = builder.BuildBootstrap(center, 1u, error);
     CHECK_DETAIL(first, error);
     const auto *page = pagesByKey(*first).at(center);
-    auto update = builder.BuildTextureStage(*first, {page->index}, 15, error);
+    const auto bootstrap = *page;
+    auto update = builder.BuildTextureStage(*first, {page->index}, targetZoom, error);
     CHECK_DETAIL(update && update->pages.size() == 1u, error);
     builder.ApplyTextureUpdate(*first, *update);
+    if (pin) builder.PinActiveTextures(*first);
     auto second = builder.BuildBootstrap(next, 2u, error);
     CHECK_DETAIL(second, error);
     const auto *carried = pagesByKey(*second).at(center);
     CHECK(carried->texture == page->texture);
     CHECK(carried->textureName == page->textureName);
-    CHECK(carried->imageryZoom == 15);
+    CHECK(carried->imageryZoom == targetZoom);
     CHECK(carried->textureSize == page->textureSize);
     CHECK(carried->texture->rgb == page->texture->rgb);
+    if (pin)
+    {
+        // A renderer can retain a refinement newer than the snapshot it ACKs.
+        // Advancing that snapshot's generation must not unpin the sharp image.
+        auto staleReplacement = *second;
+        for (auto &candidate : staleReplacement.pages)
+            if (candidate.key == center) candidate = bootstrap;
+        builder.PinActiveTextures(staleReplacement);
+        auto third = builder.BuildBootstrap(center, 3u, error);
+        CHECK_DETAIL(third, error);
+        CHECK(pagesByKey(*third).at(center)->texture == page->texture);
+        CHECK(builder.CachedPageStats().bytes == 0);
+    }
 }
 
 void testLodBandsAndProgressiveOrder()
@@ -515,6 +530,214 @@ void testLodBandsAndProgressiveOrder()
     dynamic_terrain::PersistentTerrainBuilder camera(cameraStore);
     CHECK(camera.TargetZoomForPage(snapshot, 2) == 17);
     CHECK(camera.TargetZoomForPage(snapshot, 1) == 14);
+}
+
+void comparePagePayload(const dynamic_terrain::TerrainPage &actual,
+                        const dynamic_terrain::TerrainPage &expected)
+{
+    const auto detail = dynamic_terrain::tileText(actual.key);
+    CHECK(actual.key == expected.key);
+    CHECK(actual.visualOnly == expected.visualOnly);
+    CHECK(actual.imageryZoom == expected.imageryZoom);
+    CHECK(actual.textureSize == expected.textureSize);
+    CHECK(actual.texture && expected.texture);
+    CHECK(actual.texture->width == expected.texture->width);
+    CHECK(actual.texture->height == expected.texture->height);
+    CHECK_DETAIL(actual.texture->rgb == expected.texture->rgb, detail + " imagery");
+    CHECK(actual.mesh && expected.mesh);
+    const auto &a = *actual.mesh, &b = *expected.mesh;
+    CHECK(a.positions.size() == b.positions.size());
+    CHECK(a.normals.size() == b.normals.size());
+    CHECK(a.texCoords.size() == b.texCoords.size());
+    CHECK_DETAIL(a.indices == b.indices, detail + " triangle indices");
+    for (std::size_t vertex = 0; vertex < a.positions.size(); ++vertex)
+    {
+        CHECK_DETAIL(a.positions[vertex].X() == b.positions[vertex].X() &&
+                     a.positions[vertex].Y() == b.positions[vertex].Y() &&
+                     a.positions[vertex].Z() == b.positions[vertex].Z(),
+                     detail + " position " + std::to_string(vertex));
+        CHECK_DETAIL(a.normals[vertex].X() == b.normals[vertex].X() &&
+                     a.normals[vertex].Y() == b.normals[vertex].Y() &&
+                     a.normals[vertex].Z() == b.normals[vertex].Z(),
+                     detail + " normal " + std::to_string(vertex));
+        CHECK_DETAIL(a.texCoords[vertex].X() == b.texCoords[vertex].X() &&
+                     a.texCoords[vertex].Y() == b.texCoords[vertex].Y(),
+                     detail + " UV " + std::to_string(vertex));
+    }
+}
+
+void compareSnapshotPayload(const dynamic_terrain::TerrainSnapshot &actual,
+                            const dynamic_terrain::TerrainSnapshot &expected)
+{
+    const auto expectedPages = pagesByKey(expected);
+    CHECK(actual.pages.size() == expected.pages.size());
+    CHECK(actual.estimatedTextureBytes == expected.estimatedTextureBytes);
+    for (const auto &page : actual.pages)
+    {
+        CHECK(expectedPages.count(page.key));
+        comparePagePayload(page, *expectedPages.at(page.key));
+    }
+}
+
+void testInitialPageProgress()
+{
+    using namespace dynamic_terrain;
+    TemporaryDirectory temp;
+    auto config = makeConfig(temp.Path() / "unused");
+    config.elevationProvider = "terrarium";
+    config.imageryUrl = (temp.Path() / "imagery.png").string();
+    config.elevationUrl = (temp.Path() / "elevation.png").string();
+    // More than one DEM neighborhood is required, so a source removed after
+    // the center page also exercises a later elevation request.
+    config.visualRadiusM = 3000;
+    config.visualOuterRadiusM = 100000;
+    config.visualOuterMeshCacheMb = 0;
+    normalizeConfig(config);
+    cv::Mat imagery(64, 64, CV_8UC3), elevation(64, 64, CV_8UC3);
+    for (int y = 0; y < 64; ++y)
+        for (int x = 0; x < 64; ++x)
+        {
+            imagery.at<cv::Vec3b>(y, x) = cv::Vec3b((x * 7 + y * 3) % 256,
+                (x * 3 + y * 11) % 256, (x * 13 + y * 5) % 256);
+            const auto packed = static_cast<std::uint32_t>(std::llround(
+                (32768 + 80 + 20 * std::sin(x * .11) * std::cos(y * .09)) * 256));
+            elevation.at<cv::Vec3b>(y, x) = cv::Vec3b(packed & 255, (packed >> 8) & 255, packed >> 16);
+        }
+    auto restoreSources = [&] {
+        CHECK(cv::imwrite(config.imageryUrl, imagery));
+        CHECK(cv::imwrite(config.elevationUrl, elevation));
+    };
+    restoreSources();
+    const auto geographic = makeSphericalCoordinates();
+    const auto center = latLonToTile(geographic->LatitudeDeg(), geographic->LongitudeDeg(), config.visualGeometryZoom);
+    auto makeStore = [&](const std::string &label) {
+        auto isolated = config;
+        isolated.cacheDir = (temp.Path() / label).string();
+        return std::make_shared<TileStore>(isolated, geographic);
+    };
+    auto baselineStore = makeStore("baseline");
+    PersistentTerrainBuilder baselineBuilder(baselineStore);
+    std::string error;
+    const auto baseline = baselineBuilder.BuildBootstrap(center, 100, error);
+    CHECK_DETAIL(baseline, error);
+    const auto outerBaseline = baselineBuilder.BuildOuterCoverage(*baseline, error);
+    CHECK_DETAIL(outerBaseline, error);
+    CHECK(outerBaseline->pages.size() > baseline->pages.size());
+
+    auto store = makeStore("progress");
+    PersistentTerrainBuilder builder(store);
+    std::vector<TerrainSnapshot> delivered;
+    const TileKey deferred{center.x + 1, center.y + 1, center.z};
+    auto near = builder.BuildBootstrap(center, 101, error, [&](const TerrainSnapshot &partial) {
+        CHECK(!partial.pages.empty() && partial.pages.size() <= baseline->pages.size());
+        if (delivered.empty())
+        {
+            CHECK(partial.pages.front().key == center);
+            CHECK(partial.pages.size() < baseline->pages.size());
+            CHECK(!fs::exists(store->ImageryPath(deferred)));
+        }
+        else CHECK(partial.pages.size() >= delivered.back().pages.size());
+        const auto expected = pagesByKey(*baseline);
+        for (const auto &page : partial.pages) comparePagePayload(page, *expected.at(page.key));
+        delivered.push_back(partial);
+        return true;
+    });
+    CHECK_DETAIL(near, error);
+    CHECK(!delivered.empty());
+    compareSnapshotPayload(*near, *baseline);
+    // Published snapshots own immutable buffers even as later pages are added.
+    comparePagePayload(delivered.front().pages.front(), *pagesByKey(*baseline).at(center));
+
+    std::vector<TerrainSnapshot> outerDelivered;
+    auto outer = builder.BuildOuterCoverage(*near, error, [&](const TerrainSnapshot &partial) {
+        CHECK(partial.pages.size() >= near->pages.size());
+        CHECK(partial.pages.size() <= outerBaseline->pages.size());
+        if (partial.pages.size() > near->pages.size() && outerDelivered.empty())
+        {
+            CHECK(partial.pages.size() < outerBaseline->pages.size());
+            const auto expected = pagesByKey(partial);
+            bool notDownloaded = false;
+            for (const auto &page : outerBaseline->pages)
+                if (!expected.count(page.key) && !fs::exists(store->ImageryPath(page.key))) notDownloaded = true;
+            CHECK(notDownloaded);
+        }
+        if (partial.pages.size() > near->pages.size()) outerDelivered.push_back(partial);
+        const auto expected = pagesByKey(*outerBaseline);
+        for (const auto &page : partial.pages) comparePagePayload(page, *expected.at(page.key));
+        return true;
+    });
+    CHECK_DETAIL(outer, error);
+    CHECK(!outerDelivered.empty());
+    compareSnapshotPayload(*outer, *outerBaseline);
+
+    // Delete a still-needed source only after a valid page is visible. This
+    // proves publication precedes the batch barrier, and late failure cannot
+    // mutate or invalidate the already-delivered page. Cover both imagery/DEM.
+    for (bool demFailure : {false, true})
+    {
+        auto failedStore = makeStore(demFailure ? "near-dem-failure" : "near-image-failure");
+        PersistentTerrainBuilder failing(failedStore);
+        std::vector<TerrainSnapshot> retained;
+        error.clear();
+        auto failed = failing.BuildBootstrap(center, 102, error, [&](const TerrainSnapshot &partial) {
+            retained.push_back(partial);
+            if (retained.size() == 1) CHECK(fs::remove(demFailure ? config.elevationUrl : config.imageryUrl));
+            return true;
+        });
+        CHECK_DETAIL(!failed && !error.empty() && !retained.empty(),
+            std::string(demFailure ? "DEM" : "imagery") + " failure: " + error +
+            ", published=" + std::to_string(retained.size()));
+        CHECK(retained.back().pages.size() < baseline->pages.size());
+        comparePagePayload(retained.front().pages.front(), *pagesByKey(*baseline).at(center));
+        restoreSources();
+        error.clear();
+        auto recovered = failing.BuildBootstrap(center, 103, error, [](const TerrainSnapshot &) { return true; });
+        CHECK_DETAIL(recovered, error);
+        compareSnapshotPayload(*recovered, *baseline);
+    }
+    for (bool outerMode : {false, true})
+    {
+        auto cancelledStore = makeStore(outerMode ? "outer-cancel" : "near-cancel");
+        PersistentTerrainBuilder cancelling(cancelledStore);
+        error.clear();
+        auto local = outerMode ? cancelling.BuildBootstrap(center, 104, error) : nullptr;
+        CHECK(!outerMode || local);
+        std::size_t callbacks = 0;
+        auto stop = [&](const TerrainSnapshot &partial) {
+            ++callbacks;
+            CHECK(!partial.pages.empty());
+            return false;
+        };
+        auto cancelled = outerMode ? cancelling.BuildOuterCoverage(*local, error, stop) :
+            cancelling.BuildBootstrap(center, 104, error, stop);
+        CHECK(!cancelled && !error.empty() && callbacks == 1);
+        CHECK(cancelledStore->Diagnostics().downloads.active == 0);
+        CHECK(cancelledStore->Diagnostics().downloads.queued == 0);
+    }
+    auto failedStore = makeStore("outer-failure");
+    PersistentTerrainBuilder failing(failedStore);
+    error.clear();
+    auto local = failing.BuildBootstrap(center, 105, error);
+    CHECK_DETAIL(local, error);
+    std::vector<TerrainSnapshot> retainedOuter;
+    auto failedOuter = failing.BuildOuterCoverage(*local, error, [&](const TerrainSnapshot &partial) {
+        if (partial.pages.size() > local->pages.size())
+        {
+            retainedOuter.push_back(partial);
+            if (retainedOuter.size() == 1) CHECK(fs::remove(config.imageryUrl));
+        }
+        return true;
+    });
+    CHECK(!failedOuter && !error.empty() && !retainedOuter.empty());
+    CHECK(retainedOuter.back().pages.size() < outerBaseline->pages.size());
+    const auto expectedOuter = pagesByKey(*outerBaseline);
+    for (const auto &page : retainedOuter.front().pages) comparePagePayload(page, *expectedOuter.at(page.key));
+    restoreSources();
+    error.clear();
+    auto recoveredOuter = failing.BuildOuterCoverage(*local, error, [](const TerrainSnapshot &) { return true; });
+    CHECK_DETAIL(recoveredOuter, error);
+    compareSnapshotPayload(*recoveredOuter, *outerBaseline);
+    std::cout << "Initial page progress: center first, exact near/outer arrays, late DEM/imagery recovery, cancellation passed\n";
 }
 
 void testCollisionPatchFollowsLocal2Heading()
@@ -594,12 +817,15 @@ int main()
     {
         testPagedMeshesAndDirectUvs();
         testRefinedPageCache(2u, 512, 2u);
-        testRefinedPageCache(64u, 256, 24u);
+        testRefinedPageCache(64u, 256, 341u);
         testRefinedPageCache(0u, 512, 0u);
         testRefinedPageCache(1u, 1024, 0u);
         testRefinedPageCache(128u, 2048, 10u);
         testRefinedPixelsSurviveRecenter();
+        testRefinedPixelsSurviveRecenter(true);
+        testRefinedPixelsSurviveRecenter(false, 14);
         testLodBandsAndProgressiveOrder();
+        testInitialPageProgress();
         testCollisionPatchFollowsLocal2Heading();
         std::cout << "PersistentTerrainBuilder tests passed\n";
         return 0;

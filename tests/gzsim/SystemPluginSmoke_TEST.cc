@@ -70,6 +70,7 @@ int main()
             "<visual_page_texture_max_size>256</visual_page_texture_max_size><visual_refine_texture>false</visual_refine_texture>"
             "<radius_tiles>0</radius_tiles><heightmap_size>129</heightmap_size><dynamic_zoom>false</dynamic_zoom>"
             "<static_zoom>17</static_zoom><startup_preload>false</startup_preload><diagnostics>false</diagnostics>"
+            "<update_period_sec>0.02</update_period_sec>"
             "<startup_safety_remove_delay_sec>0</startup_safety_remove_delay_sec>"
             "</plugin></model></sdf>").empty());
         auto modelPlugin = loader.Instantiate("custom::DynamicTerrainConfig");
@@ -103,6 +104,44 @@ int main()
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
         CHECK(collisionCreated && safetyRemoved);
+        // Cached replacements can finish inside the 0.10 s overlap window.
+        // Every superseded entity must still retire; never overwrite its slot.
+        auto collisionCount = [&] {
+            std::size_t count = 0;
+            ecm.Each<gz::sim::components::Name>([&](const auto &, const auto *name) {
+                if (name->Data().find("dynamic_terrain_collision_") == 0) ++count;
+                return true;
+            });
+            return count;
+        };
+        std::size_t peakCollisions = collisionCount();
+        for (int tick = 0; tick < 1000; ++tick)
+        {
+            if (tick % 40 == 0)
+                ecm.SetComponentData<gz::sim::components::Pose>(aircraft,
+                    gz::math::Pose3d((tick / 40 % 2) * 500.0, 0, 1, 0, 0, 0));
+            info.paused = tick >= 400 && tick < 480;
+            if (!info.paused) info.simTime += std::chrono::milliseconds(1);
+            info.dt = info.paused ? std::chrono::milliseconds(0) : std::chrono::milliseconds(1);
+            update->PreUpdate(info, ecm);
+            ecm.ProcessRemoveEntityRequests();
+            const auto count = collisionCount();
+            peakCollisions = std::max(peakCollisions, count);
+            CHECK(count >= 1 && count <= 2);
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        // Drain completed work and expire the final overlap.
+        info.paused = false;
+        for (int tick = 0; tick < 30; ++tick)
+        {
+            info.simTime += std::chrono::milliseconds(100);
+            update->PreUpdate(info, ecm);
+            ecm.ProcessRemoveEntityRequests();
+            CHECK(collisionCount() >= 1 && collisionCount() <= 2);
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        CHECK(collisionCount() == 1);
+        CHECK(peakCollisions == 2);
         // Plugin destructors join workers while ECM and event manager still exist.
         systemPlugin = {};
         modelPlugin = {};

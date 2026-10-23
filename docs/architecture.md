@@ -75,9 +75,41 @@ bytes. The runtime copies the snapshot's page list before handing it off;
 immutable mesh/image storage can be shared. Each renderer owns its native GPU
 resources and performs uploads on its render event thread.
 
+The Gazebo sink opts into `SupportsProgressiveInitial()`; its default is false
+for other adapters. Only the initial generation can publish cumulative snapshots
+with `progressiveInitial=true`, increasing `coverageRevision`, and a final
+`progressiveComplete=true` marker. The renderer keeps a single pending target
+and appends previously unseen pages within the upload budget. Already displayed
+pages survive superseded targets and failed additions. Each page retains the
+configured warmup, and a revision is acknowledged only after all its pages are
+ready. The final marker, rather than a fixed revision number, identifies complete
+startup coverage. Subsequent generations retain atomic staging and activation.
+The same protocol fields travel through the optional GUI preview service.
+
+`DownloadCache` is a separate static PIC library with only libcurl and Threads
+dependencies. One owning worker drives a persistent multi handle; concurrent
+blocking callers submit bounded queues with priorities and independent
+cancellation. Shared requests survive cancellation by one subscriber when
+another still needs the result. Per-host HTTP/1 scheduling avoids spending
+transfer timeouts waiting for a connection; negotiated HTTP/2 hosts can
+multiplex. Image-format validation belongs to the adapter callback, so Isaac
+can consume the same transport without OpenCV. `BUILD_DOWNLOAD_ONLY=ON` builds
+this target without simulator or OpenCV discovery. The static linkage preserves
+the existing two-library Gazebo deployment.
+
 The Gazebo Sim renderer retains staging/active/retired generations, warmup,
-frustum eviction, texture reference counts and deferred Ogre2 cleanup. GUI
-preview remains an optional Qt plugin; its server-side transport service has no
+frustum eviction, texture reference counts and deferred Ogre2 cleanup. Staging
+is uploaded over bounded render callbacks; failed staging never destroys the
+active terrain. First-start pages use the same tile geometry and image buffers,
+with no additional per-page worker or download scheduler. Gazebo's SDF adapter
+also enables ready-batch texture publication by default; explicit
+`visual_progressive_uploads=false` retains deferred texture delivery without
+changing the shared configuration default. Terrain meshes are pre-imported through Gazebo's existing
+loader with the same conversion flags before scene attachment. This avoids
+the scene factory retaining every historical terrain mesh name after resources
+are retired; ownership and deletion remain in the terrain renderer. See
+[Gazebo's Ogre2 mesh factory](https://github.com/gazebosim/gz-rendering/blob/gz-rendering10/ogre2/src/Ogre2MeshFactory.cc).
+GUI preview remains an optional Qt plugin; its server-side transport service has no
 Qt dependency. `BUILD_GUI=OFF` omits the Qt plugin.
 
 The SDF adapters are compiled against the selected distribution's SDFormat

@@ -5,6 +5,16 @@
 #include <memory>
 namespace dynamic_terrain
 {
+struct TerrainRuntimeDiagnostics
+{
+    DownloadDiagnostics downloads;
+    std::size_t decodedDemBytes{0}, decodedDemEntries{0};
+    std::size_t decodedImageryBytes{0}, decodedImageryEntries{0};
+    std::size_t pageTextureBytes{0}, pageTextureEntries{0};
+    std::size_t outerMeshBytes{0}, outerMeshEntries{0}, outerMeshLimitBytes{0};
+    std::size_t outerMeshHits{0}, outerMeshMisses{0};
+};
+
 struct CollisionRequest
 {
     TileKey center;
@@ -38,6 +48,7 @@ public:
     bool VisualBuilding() const;
     bool RefinementActive() const;
     std::uint64_t LatestVisualGeneration() const;
+    TerrainRuntimeDiagnostics Diagnostics() const;
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

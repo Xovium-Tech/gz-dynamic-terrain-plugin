@@ -34,6 +34,8 @@ public:
     void QueueSnapshot(std::shared_ptr<const TerrainSnapshot> snapshot) override;
     void QueueTexture(TextureUpdate update) override;
     std::uint64_t ActiveGeneration() const override;
+    std::uint64_t ActiveCoverageRevision() const override;
+    bool SupportsProgressiveInitial() const override { return true; }
     bool HasActiveTerrain() const override;
     std::optional<TileKey> ActiveCenterTile() const override;
 
@@ -60,6 +62,7 @@ private:
         std::shared_ptr<gz::common::Image> sourceTexture;
         std::string sourceTextureName;
         int sourceTextureSize{256};
+        int sourceImageryZoom{0};
         gz::math::Vector3d boundsMin;
         gz::math::Vector3d boundsMax;
         int offscreenFrames{0};
@@ -73,16 +76,22 @@ private:
         bool textureReferenceHeld{false};
         std::size_t textureBytes{0};
         bool gpuResident{false};
+        int startupWarmupFrames{-1};
     };
 
     struct Slot
     {
         std::uint64_t generation{0};
+        std::uint64_t coverageRevision{0};
         TileKey centerTile;
         std::string resourcePrefix;
         std::vector<PageSlot> pages;
         std::size_t estimatedTextureBytes{0};
         int warmupFrames{0};
+        std::shared_ptr<const TerrainSnapshot> uploading;
+        bool progressiveInitial{false};
+        bool progressiveComplete{true};
+        std::size_t uploadCursor{0};
     };
 
     std::shared_ptr<gz::common::Image> RenderImage(
@@ -97,6 +106,9 @@ private:
         bool *resourcePressureCandidate = nullptr);
     std::optional<Slot> CreateSlotWithRecovery(
         const std::shared_ptr<const TerrainSnapshot> &snapshot);
+    void AdvanceStagingUpload();
+    bool AdoptProgressiveSnapshot(const std::shared_ptr<const TerrainSnapshot> &snapshot);
+    void AdvanceProgressiveUpload();
     std::optional<PageSlot> CreatePage(
         const TerrainSnapshot &snapshot, const TerrainPage &page);
     bool MakePageResident(const std::string &resourcePrefix,
@@ -121,6 +133,7 @@ private:
     void ClearActiveState();
     void DestroySlot(Slot &slot);
     void ApplyPendingTexture();
+    void MergePendingTexture(TextureUpdate update, bool replaceEqual);
 
     // Weak entries preserve CPU image sharing between active/staging pages
     // without extending the lifetime of retired resources.
@@ -137,6 +150,7 @@ private:
     std::optional<Slot> retired_;
 
     std::atomic<std::uint64_t> activeGeneration_{0};
+    std::atomic<std::uint64_t> activeCoverageRevision_{0};
     std::atomic<bool> hasActive_{false};
     std::atomic<int> activeCenterX_{0};
     std::atomic<int> activeCenterY_{0};

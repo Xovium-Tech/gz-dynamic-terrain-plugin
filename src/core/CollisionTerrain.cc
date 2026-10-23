@@ -86,6 +86,7 @@ std::optional<CollisionPatch> CollisionTerrainBuilder::Build(
     const int cells = size - 1;
     for (int row = 0; row < size; ++row)
     {
+        if (ScopedDownloadContext::Cancelled()) { error = "collision build cancelled"; return std::nullopt; }
         const double v = static_cast<double>(row) / cells;
         const double tileY = rect.minY + (rect.maxY + 1.0 - rect.minY) * v;
         const double lat = tileYToLat(tileY, rect.zoom);

@@ -21,6 +21,9 @@ struct TerrainConfig
     std::string elevationToken;
     int elevationMaxZoom{15};
     double visualRadiusM{7500.0};
+    // Additional visual-only quadtree coverage; zero preserves legacy extent.
+    double visualOuterRadiusM{0.0};
+    std::size_t visualOuterMeshCacheMb{128};
     bool visualGui{false};
     int visualGeometryZoom{14};
     int visualElevationZoom{13};
@@ -45,9 +48,13 @@ struct TerrainConfig
     };
     double visualRecenterDistanceM{1800.0};
     int visualWarmupFrames{1};
+    int visualUploadPagesPerFrame{8};
+    double visualUploadBudgetMs{2.0};
+    double visualActivationTimeoutSec{5.0};
     bool visualFrustumEviction{true};
     int visualOffscreenFrames{30};
     bool visualRefineTexture{true};
+    bool visualProgressiveUploads{false};
     int visualRecenterReadyZoom{14};
     int visualRefineMaxSourceTilesPerBatch{32};
     bool visualLightingEnabled{false};
@@ -60,6 +67,7 @@ struct TerrainConfig
     std::string userAgent{"gz-dynamic-terrain/0.2.1"};
     std::string cacheDir{"~/.cache/gz_dynamic_terrain"};
     std::size_t decodedDemCacheMb{256};
+    std::size_t decodedImageryCacheMb{64};
     bool dynamicZoom{true};
     int staticZoom{17};
     int minZoom{12};

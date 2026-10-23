@@ -336,6 +336,9 @@ void normalizeConfig(Config &cfg)
     cfg.elevationMaxZoom = clampValue(cfg.elevationMaxZoom, 1, 20);
 
     cfg.visualRadiusM = clampValue(cfg.visualRadiusM, 1000.0, 30000.0);
+    cfg.visualOuterRadiusM = clampValue(cfg.visualOuterRadiusM, 0.0, 2000000.0);
+    if (cfg.visualOuterRadiusM <= cfg.visualRadiusM) cfg.visualOuterRadiusM = 0.0;
+    cfg.visualOuterMeshCacheMb = std::min<std::size_t>(cfg.visualOuterMeshCacheMb, 1024u);
     cfg.visualGeometryZoom = clampValue(cfg.visualGeometryZoom, 8, 18);
     cfg.visualElevationZoom = clampValue(cfg.visualElevationZoom, 8, cfg.elevationMaxZoom);
     cfg.visualMeshCellsPerTile = clampValue(cfg.visualMeshCellsPerTile, 8, 128);
@@ -363,6 +366,9 @@ void normalizeConfig(Config &cfg)
     cfg.visualRecenterDistanceM = clampValue(cfg.visualRecenterDistanceM, 100.0,
                                              std::max(100.0, cfg.visualRadiusM * 0.5));
     cfg.visualWarmupFrames = clampValue(cfg.visualWarmupFrames, 1, 10);
+    cfg.visualUploadPagesPerFrame = clampValue(cfg.visualUploadPagesPerFrame, 1, 4096);
+    cfg.visualUploadBudgetMs = clampValue(cfg.visualUploadBudgetMs, 0.1, 1000.0);
+    cfg.visualActivationTimeoutSec = clampValue(cfg.visualActivationTimeoutSec, 1.0, 300.0);
     cfg.visualOffscreenFrames = clampValue(cfg.visualOffscreenFrames, 1, 600);
     cfg.visualRecenterReadyZoom = clampValue(
         cfg.visualRecenterReadyZoom, cfg.visualGeometryZoom, 20);
@@ -379,6 +385,7 @@ void normalizeConfig(Config &cfg)
     cfg.downloadRetries = clampValue(cfg.downloadRetries, 0, 5);
     cfg.httpTimeoutMs = clampValue(cfg.httpTimeoutMs, 1000u, 30000u);
     cfg.decodedDemCacheMb = clampValue<std::size_t>(cfg.decodedDemCacheMb, 32u, 2048u);
+    cfg.decodedImageryCacheMb = clampValue<std::size_t>(cfg.decodedImageryCacheMb, 0u, 2048u);
 
     cfg.radiusTiles = clampValue(cfg.radiusTiles, 0, 8);
     cfg.meshCells = clampValue(cfg.meshCells, 4, 128);

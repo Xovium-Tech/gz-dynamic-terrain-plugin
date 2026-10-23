@@ -93,8 +93,8 @@ namespace dynamic_terrain
                     }
                 }
 
-                applyCollisionResult(simTime, ecm);
                 retireOldCollision(simTime, ecm);
+                applyCollisionResult(simTime, ecm);
                 updateStartupSafetyGround(simTime, ecm);
 
                 if (info.paused)
@@ -203,7 +203,7 @@ namespace dynamic_terrain
                             cfg_.downloadConcurrency,
                             " per_host=", cfg_.downloadPerHost,
                             " retries=", cfg_.downloadRetries,
-                            " no_started_request_cancellation=true");
+                            " cancellable_requests=true");
 
                     if (cfg_.startupPreload)
                     {
@@ -228,6 +228,11 @@ namespace dynamic_terrain
 
             void applyCollisionResult(double simTime, gz::sim::EntityComponentManager &ecm)
             {
+                // Keep at most the active patch and its overlapping predecessor.
+                // PollCollision coalesces completed work while this slot is busy.
+                // Replacing it early would lose the predecessor's retirement.
+                if (retiringCollisionEntity_ != gz::sim::kNullEntity)
+                    return;
                 auto result = runtime_->PollCollision(currentCollisionEntity_ != gz::sim::kNullEntity);
                 if (!result) return;
 
@@ -264,16 +269,23 @@ namespace dynamic_terrain
 
             void retireOldCollision(double simTime, gz::sim::EntityComponentManager &ecm)
             {
-                if (retiringCollisionEntity_ == gz::sim::kNullEntity ||
-                    simTime < retireCollisionAtSimTime_)
+                if (retiringCollisionEntity_ == gz::sim::kNullEntity)
+                    return;
+                // Removal requests are deferred by Gazebo. Keep the slot busy
+                // until the entity is actually gone, including during pauses.
+                if (!ecm.HasEntity(retiringCollisionEntity_))
+                {
+                    retiringCollisionEntity_ = gz::sim::kNullEntity;
+                    retireCollisionAtSimTime_ = -1.0;
+                    return;
+                }
+                if (simTime < retireCollisionAtSimTime_)
                     return;
                 gz::sim::SdfEntityCreator creator(ecm, *eventManager_);
                 creator.RequestRemoveEntity(retiringCollisionEntity_, true);
                 if (cfg_.diagnostics)
                     logInfo("[DynamicTerrain][COLLISION] retired old entity=",
                             retiringCollisionEntity_);
-                retiringCollisionEntity_ = gz::sim::kNullEntity;
-                retireCollisionAtSimTime_ = -1.0;
             }
 
             void ensureStartupSafetyGround(gz::sim::EntityComponentManager &ecm)
@@ -350,13 +362,29 @@ namespace dynamic_terrain
                         return;
                 }
                 lastStatusWall_ = now;
+                const auto metrics = runtime_ ? runtime_->Diagnostics() : TerrainRuntimeDiagnostics{};
                 logInfo("[DynamicTerrain][STATUS] ", state,
                         " active_visual_generation=", renderer_ ? renderer_->ActiveGeneration() : 0,
                         " visual_building=", (runtime_ && runtime_->VisualBuilding()) ? "true" : "false",
                         " refinement_active=", (runtime_ && runtime_->RefinementActive()) ? "true" : "false",
                         " latest_visual_request=", (runtime_ ? runtime_->LatestVisualGeneration() : 0),
                         " collision_entity=", currentCollisionEntity_,
-                        " collision_generation=", currentCollisionGeneration_);
+                        " collision_generation=", currentCollisionGeneration_,
+                        " download_queued=", metrics.downloads.queued,
+                        " download_active=", metrics.downloads.active,
+                        " download_peak_queued=", metrics.downloads.peakQueued,
+                        " download_peak_active=", metrics.downloads.peakActive,
+                        " download_buffer_bytes=", metrics.downloads.bufferedBytes,
+                        " download_cache_hits=", metrics.downloads.cacheHits,
+                        " downloaded=", metrics.downloads.downloaded,
+                        " download_failed=", metrics.downloads.failed,
+                        " download_cancelled=", metrics.downloads.cancelled,
+                        " download_bytes=", metrics.downloads.bytes,
+                        " download_connections=", metrics.downloads.connections,
+                        " download_retries=", metrics.downloads.retries,
+                        " decoded_dem_bytes=", metrics.decodedDemBytes,
+                        " decoded_imagery_bytes=", metrics.decodedImageryBytes,
+                        " page_texture_bytes=", metrics.pageTextureBytes);
             }
 
         private:

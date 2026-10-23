@@ -8,12 +8,17 @@ message PageInfo {
   string submesh_name = 7;
   uint32 texture_size = 8;
   int32 imagery_zoom = 9;
+  bool visual_only = 10;
 }
 message Manifest {
   uint32 version = 1;
   uint64 revision = 2;
   string prefix = 3;
   repeated PageInfo pages = 4;
+  uint64 generation = 5;
+  uint64 coverage_revision = 6;
+  bool progressive_initial = 7;
+  bool progressive_complete = 8;
 }
 message Page {
   PageInfo info = 1;

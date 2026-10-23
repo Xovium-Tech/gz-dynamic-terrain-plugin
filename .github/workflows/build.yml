@@ -16,7 +16,7 @@ jobs:
       - name: Install simulator-independent dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build g++ libcurl4-openssl-dev libopencv-dev
+          sudo apt-get install -y cmake ninja-build g++ libcurl4-openssl-dev libopencv-dev libjpeg-dev
       - name: Build without Gazebo
         run: |
           cmake -S . -B build-core -G Ninja -DBUILD_SIMULATOR=OFF -DBUILD_GUI=OFF -DCMAKE_BUILD_TYPE=Release
@@ -37,7 +37,7 @@ jobs:
           DISTRO: ${{ matrix.distro }}
         run: |
           sudo apt-get update
-          sudo apt-get install -y curl gnupg cmake ninja-build g++ libcurl4-openssl-dev libopencv-dev protobuf-compiler libprotobuf-dev xvfb libgl1-mesa-dri
+          sudo apt-get install -y curl gnupg cmake ninja-build g++ libcurl4-openssl-dev libopencv-dev libjpeg-dev protobuf-compiler libprotobuf-dev xvfb libgl1-mesa-dri
           sudo curl -fsSL https://packages.osrfoundation.org/gazebo.gpg -o /usr/share/keyrings/gazebo-archive-keyring.gpg
           echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/gazebo-archive-keyring.gpg] https://packages.osrfoundation.org/gazebo/ubuntu-stable noble main' | sudo tee /etc/apt/sources.list.d/gazebo-stable.list
           sudo apt-get update

@@ -7,13 +7,23 @@ Stream map imagery and elevation terrain around a moving model in **Gazebo
 Harmonic or Jetty**. One shared terrain engine handles tile downloads,
 caching, mesh generation, collision terrain and progressive texture detail.
 
+Optional outer terrain uses a balanced quadtree with stitched boundaries while
+preserving the existing near mesh and imagery. Enable it with
+`visual_outer_radius_m` (default `0`, maximum `2000000` metres) for high-altitude
+views; match the camera's far clipping plane to the required viewing distance.
+On first startup, completed geographic pages appear independently, including
+the outer terrain, and ready imagery refinements publish in bounded batches.
+Tile sizes, final geometry, imagery quality and collision remain unchanged.
+Complete terrain remains visible during later replacements. See
+[distant coverage and camera clipping](https://github.com/Xovium-Tech/gz-dynamic-terrain-plugin/blob/main/docs/configuration.md#distant-coverage-and-camera-clipping)
+for resource limits and the 30 km flight preset.
+
 [![Watch the terrain demo](https://xovium.tech/media/dynamic-terrain-demo-140cfb8db1ca/preview.gif)](https://xovium.tech/videos/dynamic-terrain/)
 
-**Source-only distribution:** download the release ZIP and compile it on the
-computer running Gazebo. The archive contains source, headers, CMake files,
-`build.sh`, this README, and LICENSE. It excludes docs, images, examples, tests,
-development tools, CI files, and prebuilt libraries. GitHub's automatic source
-ZIP/tar.gz downloads use the same exclusions.
+**Upstream release archives** contain buildable source and exclude development
+tests, examples and prebuilt libraries; compile them on the computer running
+Gazebo. Repository checkouts also provide `package.sh` for complete local source
+archives or packages containing binaries built for a specific Gazebo release.
 
 ## Supported Gazebo versions
 
@@ -41,7 +51,7 @@ Install the common build dependencies:
 ```bash
 sudo apt update
 sudo apt install build-essential git cmake pkg-config \
-  libcurl4-openssl-dev libopencv-dev libprotobuf-dev protobuf-compiler
+  libcurl4-openssl-dev libopencv-dev libjpeg-dev libprotobuf-dev protobuf-compiler
 ```
 
 Then install the development packages for **your chosen target only**, with the
@@ -65,7 +75,7 @@ git clone --depth 1 https://github.com/Xovium-Tech/gz-dynamic-terrain-plugin.git
 cd gz-dynamic-terrain-plugin
 ```
 
-Alternatively, download `gz-dynamic-terrain-plugin-v0.2.1.zip` from the
+Alternatively, download `gz-dynamic-terrain-plugin-v0.3.0.zip` from the
 [latest release](https://github.com/Xovium-Tech/gz-dynamic-terrain-plugin/releases/latest),
 extract it and open a terminal in the extracted directory.
 
@@ -89,6 +99,17 @@ cmake --build build-jetty --parallel 2
 ```
 
 Replace `jetty` in both places with `harmonic` for a Harmonic build.
+
+See [performance validation](https://github.com/Xovium-Tech/gz-dynamic-terrain-plugin/blob/main/docs/performance-validation.md) for exact-output
+comparisons, download failure tests, measured results and configurable soak runs.
+
+From a repository checkout, for a local archive with development files, run `./package.sh /tmp/terrain-source.tar.gz`.
+Add `--with-binaries build-jetty` (or `build-harmonic`) to include locally built
+libraries. Archives include `SOURCE_MANIFEST.json`; binary archives also contain
+`BINARY_MANIFEST.json` with the simulator distribution, dependencies and hashes.
+The helper rejects stale binaries and uses an isolated install directory to set
+their runtime paths. Extract the archive and point `GZ_SIM_SYSTEM_PLUGIN_PATH`
+at its `lib` directory when using compatible prebuilt libraries.
 
 ## 3. Load the plugin
 
